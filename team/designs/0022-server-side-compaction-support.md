@@ -60,9 +60,12 @@ On `main`, the summarize strategy writes a client-side summary on every provider
 1. **Resolve.** `summarizer_model = config.model or agent.aux_model`. `resolve(agent)` returns `NativeSummarizer` when `summarizer_model.model_info.capabilities.server_side_compaction is True`; `False` or `None` returns `BaseSummarizer`. It returns `None`, and the pass is skipped, when no summarizer model resolves. Providers declare the value and developers override it through `model_info`. Wrappers report the inner model's `model_info`. No method-identity checks.
 2. **Cut.** `plan_cut(messages, keep_head)` reads `preserve_recent` from the config and returns `Cut(head, body, tail)`. It's a pure function: tool pairs stay whole, roles alternate at the body/tail boundary, it stops at the first pin, and an earlier summary rolls into `body`. Each summarizer carries its own `keep_head`: base 1, native 0.
 3. **Summarize.** `BaseSummarizer` sends `cut.body`, flattened, with the summarizer prompt and no live system or tools, through `model.stream`. `NativeSummarizer` sends `cut.body`, which starts at message 0 because its `head` is empty, with live system and tools to `Model.compact()`; the tail isn't sent. If `compact()` returns `None`, the strategy re-cuts with `keep_head = 1` and runs the base path in the same pass.
-4. **Result.** `SummaryResult.block` is a `TextBlock` with `metadata.offloaded = {method: "summarize"}`. Only native results carry `providerData` (#5402).
+4. **Result.** `SummaryResult.block` is a `TextBlock` with `metadata.offloaded = {method: "summarize", removed_messages, removed_tokens}`; the counts exist because the render step reads them. Stored `text` is the summary alone, with no header. Only native results carry `providerData` (#5402).
 5. **Place.** `head + [summary] + tail`, never joined, so `merged_messages` goes away. On the native path the block is first, and `place()` records message 0 for re-statement.
-6. **Render.** One shared pre-format step merges adjacent same-role messages for the wire without changing stored history. `metadata` never reaches the wire; `providerData` reaches only its own provider and renders as plain text elsewhere.
+6. **Render.** One shared pre-format step, at the single point where history is handed to the model, prepares the wire copy without changing stored history:
+   - It renders a base summary as `[Summarized: N messages, ~T tokens]` followed by the summary, using `main`'s existing formatter and `metadata.offloaded`'s counts, so the model keeps seeing the same cue. Native blocks are never given a header.
+   - It merges adjacent same-role messages, as `main`'s `repair_alternation` does in storage today.
+   - `metadata` never reaches the wire. `providerData` reaches only its own provider; every other formatter already sends only `text`, so only the Anthropic formatter changes.
 7. **Stale thinking.** Reactive `drop_block` stays the default. Where `block_binding` is unavailable, the provider strips the stale thinking itself. Dropped blocks are reported as a metric.
 
 **Pros:**
@@ -74,7 +77,7 @@ On `main`, the summarize strategy writes a client-side summary on every provider
 
 **Cons:**
 
-- The wire for the base path is unchanged, but stored history now holds adjacent same-role messages (message 0 and a user-role summary), so every reader of `agent.messages` sees a new shape (O6).
+- The base path's summary text on the wire matches `main` (the render step re-adds the header). The request still differs from `main` in two deliberate ways: message 0 is kept, and the summary is its own message rather than appended to an assistant neighbor. Stored history can hold adjacent same-role messages, so every reader of `agent.messages` sees a new shape (O6).
 - Native compaction replaces message 0 until mid-conversation system messages land (#5176), which is why native stays opt-in until then (O2).
 - Stopping the cut at the first pin can summarize less than #5470 when a pin sits early (O3), and message-level target filters such as `"tool_results"` select non-contiguous messages that a contiguous `body` can't express (O4).
 - Native behavior on Bedrock paths is undocumented or untested live (O1).
@@ -148,7 +151,7 @@ model_id=<sonnet-5.5-id> | history edit invalidated replayed thinking blocks, re
 
 The goal is no change for users who don't opt in until each step is safe.
 
-1. **Split lands (#5733).** `AnthropicModel` declares `server_side_compaction=None`, so everyone takes the base path. Stored summaries change shape (metadata, separate message); the wire for the base path doesn't. Old sessions keep loading (see Decisions needed, D3).
+1. **Split lands (#5733).** `AnthropicModel` declares `server_side_compaction=None`, so everyone takes the base path. Stored summaries change shape (metadata, separate message, no header). On the wire, the base summary text is unchanged; the only differences are that message 0 is kept and the summary is its own message. Old sessions keep loading (see Decisions needed, D3).
 2. **Native lands (#5401).** Opt-in only, through `model_info`. Opting in accepts that message 0 is replaced by the summary.
 3. **Re-statement lands (#5176, then `restate_head`).** `AnthropicModel` declares `True` for preserved-thinking model IDs. From here, preserved-thinking users get native compaction by default, with message 0 re-stated. Docs (#5405) call out the behavior and cost change.
 
@@ -220,7 +223,7 @@ flowchart TD
   ncall --> out
   bcall --> out["SummaryResult: TextBlock + metadata.offloaded, providerData only from native"]
   out --> place["place: head + [summary] + tail, never joined<br/>native: block first, message 0 pending re-statement"]
-  place --> render["render: shared same-role merge for the wire<br/>metadata off the wire, providerData to its provider only"]
+  place --> render["render (one shared step): base summary gets its [Summarized] header back<br/>same-role merge for the wire; metadata off the wire, providerData to its provider only"]
   render --> record["record usage"]
 ```
 
@@ -314,7 +317,7 @@ Each row is one PR per SDK, or one PR with both and parity noted in the descript
 | 3 | `server_side_compaction` capability (#5466) | `_model_info.py` / `model-info.ts`, wrappers | — | Field exists, defaults `None`; wrappers report the inner model's value; `model_info` override wins | unit | Name must match #5466 and #5405 |
 | 4 | Pure `plan_cut` | `offload/summarize.py`, `offload/summarize.ts` | — | `plan_cut` has no I/O; tool pairs never split; body/tail roles alternate; stops at first pin; earlier summary rolls into body; #5736 fuzz corpus passes with no skipped pass | unit + property tests, shared fixtures across SDKs | Behavior change for early pins (O3) |
 | 5 | Summarizer split (#5733, rework of #5470) | `offload/summarize.*`, `models/_summarize.py`, `models/summarize.ts`, `models/model.*` | 1, 3, 4 | No `Model.summarize()`, no `_overrides_summarize`, no `[Summarized:` string match on write; `BaseSummarizer` path places `head + [summary] + tail`; `Model.compact()` exists and returns `None` by default; `None` re-cuts with `keep_head=1` | unit: both paths, fallback, usage recorded once per pass | Largest PR; split into base and native-scaffold PRs if it crosses the complexity label |
-| 6 | Shared same-role merge at render | shared pre-format step used by every provider | 5 | Stored history unchanged after a request; every provider receives alternating roles; base-path wire bytes match `main` for the same history | unit per provider; mocked-wire Anthropic, Bedrock | A third-party provider that bypasses the shared step (O6) |
+| 6 | Shared same-role merge at render | one shared pre-format step at the point history is handed to the model | 5 | Stored history unchanged after a request; every provider receives alternating roles; the rendered base summary text is byte-identical to `main`'s; for the same history, the request differs from `main` only by the intended differences (message 0 kept, summary as its own message) | unit per provider; mocked-wire Anthropic, Bedrock | A third-party provider that bypasses the shared step (O6) |
 | 7 | Session compatibility | summarize strategy read path | 5 | A session saved with the `[Summarized:` header is recognized as a summary for one release; a new session never contains the header | unit with saved fixtures | Dual detection lingers past one release |
 | 8 | Anthropic native compaction (#5401) | `models/anthropic.*` | 2, 5 | `compact()` sends `compact-2026-09-04` with live system and tools; returns `None` when unavailable; result carries `providerData` and is sent back byte-identical; `compaction` is a first-class parameter; capability stays `None` (opt-in) | unit; mocked-wire T3 scenarios; integ on first-party | Beta API changes |
 | 9 | Provider-owned stripping for `between_tools` | `models/anthropic.*`, `models/bedrock.*`, `_thinking_binding.py` / `thinking-binding.ts` | 5 | Where `block_binding` can't be set, stale thinking after a summary is stripped before send; no 400 reaches the caller in the T3 `between_tools` scenario | unit; mocked-wire | Strips reasoning that would have been accepted |
@@ -362,7 +365,7 @@ Follow-ups, not in this plan (T7): a supported `client=` parameter on `Anthropic
 | # | Question | Recommendation | Cost |
 |---|---|---|---|
 | D1 | Default native on, or opt-in until #5176 + re-statement? (O2) | Opt-in until row 11 lands; fall back to summarizer instructions asking to keep the task for models without system messages | Preserved-thinking users keep paying `drop_block` reasoning loss until then |
-| D2 | Where does same-role merging happen? (O6) | One shared pre-format step, called by every vended provider and documented for third-party ones | Third-party providers that format raw history must adopt it |
+| D2 | Where does same-role merging happen? (O6) | One shared pre-format step at the single point history is handed to the model, so providers need no change; it also re-adds the base summary header | A custom model that reads `agent.messages` directly sees unmerged, header-less history |
 | D3 | Saved sessions with the `[Summarized:` header (O5) | Read-time dual detection for one release, then remove | One more release of string matching on read |
 | D4 | Set `drop_block` up front for preserved-thinking IDs, or only reactively? (O8) | Reactive, pending V5 | One failed request per model per session |
 | D5 | `compact()` on `Model` or a separate protocol? (O9) | On `Model`, returning `None` by default: it needs the provider client, and capability routing already gates it | One more method on the base class |
