@@ -1,950 +1,375 @@
-# Server Side Compaction Support
+# Summarizer architecture for server-side compaction
 
-**Date**: 2026-10-14
+**Date**: 2026-11-02
 
 **Issue**: [#4933](https://github.com/strands-agents/harness-sdk/issues/4933), [#5410](https://github.com/strands-agents/harness-sdk/issues/5410)
 
-**Scope**: Supporting Server Side Context Management Strategies
+**Scope**: Part 1 of #5410 (summarization). Part 2 (tool-result clearing, thinking clearing, tool-list changes) and Part 3 (other providers' compaction) are out of scope; they reuse the capability and `providerData` contracts defined here.
 
 ## Overview
 
-Read: https://platform.claude.com/docs/en/build-with-claude/preserved-thinking
+The summarize strategy shortens long conversations by replacing older turns with a summary. On preserved-thinking Claude models (Claude Fable 5.1, Claude Opus 5.5, Claude Sonnet 5.5, Claude Haiku 5.5), any client-side rewrite of earlier history invalidates the thinking replayed after it. Anthropic's on-demand compaction (beta `compact-2026-09-04`) produces the summary server-side instead, but the returned block must be sent back exactly as returned and must come first.
 
-<!-- Is there any mention of thinking blocks in any other design document?  -->
+This design proposes two summarizers behind one strategy:
 
-Thinking blocks that are formed by Anthropic Models (Claude Opus 5.5, Claude Fable 5.1, Haiku 5.5, and Sonnet 5.5). Strands Agents SDK accepts a thinking block as a `ReasoningBlock`: 
+- a `BaseSummarizer` that writes a client-side text summary, used by every provider;
+- a `NativeSummarizer` that calls a new `Model.compact()`, used only when the summarizer model declares `server_side_compaction`.
 
-```typescript
-export interface ReasoningBlockData {
-    text?: string              // the reasoning text
-    signature?: string         // cryptographic signature for verification
-    redactedContent?: Uint8Array
-  }
-```
+A pure `plan_cut` decides what is summarized, every summary is its own message, and block metadata (not a text header) marks a summary. Python and TypeScript ship the same concepts and names.
 
-Each thinking block's `signature` are tied to the prefix, which includes `SystemPrompt`, `ToolsList`, and `ConversationHistory` of the LLM that generated that block. 
-
-When an agent running in auto mode reaches a context window of 85% capacity, then the agent will summarize the oldest messages and the agent keeps the most recent 4 messages verbatim. This will fail with `preserved_thinking` models. 
-
-Auto mode also truncates tools results automatically which will not affect preserved thinking models because the tool result is changed before a model sees the tool result and therefore not thinking block can be formed on the tool result. 
-
-This effects customers that use the `"auto"` mode or any that use ContextManagement techniques that ever modify context. This also only effects customers that are using `preserved_thinking` Anthropic models. With this paradigm shift into LLM providers having restrictions on using their native APIs to modify context, there needs to be a universal way to switch to server side context management techniques for the specific LLM provider you are dealing with at that point in time. 
+The default experience doesn't change until native compaction can preserve the user's opening message; see [Rollout](#rollout).
 
 ## Problem
 
-Server-side context management ensures that thinking data is private to the LLM provider. More and more LLM providers may follow Anthropic's lead. This affects how Strands modifies `chat_history`, `tools_lists`, and `system_prompts`.
+Developers running long agent sessions need the context manager to summarize older turns without breaking the next model call, and without silently changing what the agent remembers.
 
-Agent developers are finding new ways to increase agent performance when modifying the context window to save performance. It is a common strategy to limit token usage. How do agent developers continue to modify every bit of data in an agent's context history while respecting LLM provider's restrictions?
+Preserved-thinking models bind each thinking block to the model and to the conversation prefix that produced it. If system, tools, or earlier messages change, replaying the block returns HTTP 400 ("bound to a different conversation"). Accounts created on or after 2026-08-31 enforce this by default; older accounts only when the request sets `thinking.block_binding.prefix_mismatch_behavior`. A client-side summary is exactly this kind of rewrite.
 
-Strands modifies content in the context window through the current ContextManagement [methods](https://github.com/strands-agents/harness-sdk/tree/main/strands-ts/src/context-manager/methods). These functions will be affected by Anthropic's preserved thinking changes.
+Strands has to support two summary operations with different contracts:
+
+| | Base summary | Native compaction |
+|---|---|---|
+| Input | the selected body, after message 0 | the opening prefix, including message 0 |
+| Request | summarizer prompt, no tools | live system prompt and tools |
+| Output | text Strands may annotate | opaque block, sent back unchanged |
+| Placement | after message 0 | first in `messages` |
+
+The first attempt (#5470, unmerged) carries both through one `Model.summarize()` override. It works, but about 12 interlocking rules make it hard to change, the strategy file took 9 fix commits, and all of it is duplicated across SDKs. Three root causes:
+
+1. One method carries both contracts.
+2. Earlier summaries are found by matching a `[Summarized: N messages, T tokens]` text header, which a user can type.
+3. Summaries are joined into neighbor messages, which needs role selection, block ordering, and `metadata.custom.merged_messages` offsets so stash refs keep resolving.
 
 ### Current State
 
-Strands has no concept of preserved-thinking compatibility today. Dropping thinking blocks is effectively how context reduction already behaves: when a context-reduction strategy removes or rewrites a message, any `ReasoningBlock` inside it is simply dropped from the next request's history — nothing recognizes that the block's `signature` is tied to a prefix that must stay intact.
+On `main`, the summarize strategy writes a client-side summary on every provider. On a preserved-thinking model, the next request hits the binding 400. `AnthropicModel` and `BedrockModel` catch it and retry once with `drop_block` (`anthropic.py:1148`, `bedrock.py:583`). `drop_block` then stays on for every later request to that model. The only signal is one warning, and these models hide thinking text by default (`display: "omitted"`), so users can't see that reasoning was dropped. When thinking isn't a dict config (Sonnet 5.5's `between_tools`), the retry can't apply and the 400 reaches the user.
 
-The one place reasoning content gets special treatment today is at the sub-message (block) level: [`BaseOffloadStrategy._blockMatchesTarget`](https://github.com/strands-agents/harness-sdk/blob/main/strands-ts/src/context-manager/strategies/offload/base.ts) explicitly excludes `ReasoningBlock` from being targeted by per-block offload strategies, so block-level truncate/drop strategies skip over thinking content rather than editing it in place. There is no equivalent protection at the *message* level: the message-level `Offload.drop`/`Offload.summarize` strategies remove or replace whole messages without checking whether a dropped message carries a thinking block tied to the live prefix. 
+#5470 (open; resolves #5464) adds the experimental `Model.summarize()`. Read at its head (`b954286`):
+
+- The override is detected by function identity (`_overrides_summarize`, `summarize.py:296`) and called only when `indices[0] == 0` (`:402`).
+- `_is_text` sends text summaries through header insertion and neighbor joining. Under #5402, a native result is a `TextBlock` with `providerData`, so this code would rewrite and merge it, which Anthropic rejects (400 `compaction_signature_invalid` / `compaction_content_mismatch`).
+- When native compaction is unavailable, `super().summarize()` returns text that replaces message 0.
+- A fuzz run found that with `preserve_recent` ≤ 1, #5470 skips a pass that `main` summarizes in 85 of 3,000 histories (#5736). The built-in configs (`preserve_recent=4`, `0.7`) never hit this.
 
 ## Proposal
 
-For the first part of this solution, the summarizer method for Anthropic models with Preserved Thinking will be written to go through the Claude Native API. This will allow for server side context management and then Anthropic will not return a 400 error. 
-
-## Approach 1: Server-side context management versus client-side context management
-
-Anthropic's preserved-thinking models return a 400 when the prefix of a thinking block has been modified. So whenever Strands summarizes the history of one of these models, the summary has to come from Claude's API (server-side compaction) rather than from a client-side summarizer.
-
-The SDK needs this path to work for any provider, without the context manager knowing which provider it is talking to. Token counting already solves the same problem: `Model.countTokens()` has a working default (a heuristic estimate), and providers with a native API override it (`AnthropicModel`, `BedrockModel` and `GeminiModel` call their provider's count-tokens API and fall back to `super`). Callers only ever call `model.countTokens(...)`.
-
-Compaction follows the same pattern:
-
-- `Model.compact()` is a concrete method whose default is today's client-side summary.
-- `AnthropicModel` overrides it to call Anthropic's on-demand compaction when the model supports it, and otherwise defers to `super.compact()`.
-- `SummarizeStrategy` always calls `model.compact(...)` for message-level summaries. It never checks which provider it has.
-
-Whether a model supports server-side compaction comes from `model.metadata.capabilities.serverCompaction` (`server_compaction` in Python), proposed in the [model metadata design](https://github.com/strands-agents/harness-sdk/pull/5305). Strands doesn't add a provider-neutral config flag; see "Alternative: A `requiresServerSideCompaction` flag on `BaseModelConfig`".
-
-```mermaid
-sequenceDiagram
-    participant Agent
-    participant CM as ContextManager<br/>(Summarize strategy)
-    participant Model as Resolved model<br/>(config.model ?? agent.auxModel)
-    participant API as Provider API
-
-    Agent->>CM: reduce(agent)<br/>(overflow or utilization threshold)
-    CM->>Model: compact(messages, preservedMessages, systemPrompt, toolSpecs, instructions)
-
-    alt AnthropicModel, serverCompaction is true or unknown
-        Model->>API: compaction request<br/>(same system, tools, thinking)
-        API-->>Model: signed compaction block
-        Model-->>CM: [summary message (TextBlock + providerData), ...recent]
-        Note over Agent,API: AnthropicModel sends the summary back as the signed compaction block.<br/>Thinking blocks in the recent messages stay valid.
-    else Any other provider, or serverCompaction is false
-        Model->>Model: super.compact(): client-side summary
-        Model-->>CM: [summary message, ...recent]
-        Note over Agent,API: Same behavior as today. On a history-bound model,<br/>AnthropicModel doesn't take this path (see below).
-    end
-
-    CM->>Agent: messages = compacted
-    Agent->>API: next model call
-```
-
-#### `Model.compact()`
-
-`compact()` is non-abstract, and its default is the client-side summary `SummarizeStrategy` produces today: it summarizes the older messages with the model it's called on and returns `[summary, ...preserved]`. Providers without server-side compaction need no code.
-
-The parameters mirror `OffloadConditions`:
-
-- `preservedMessages` takes the same count-or-ratio as `preserveRecent` and sets the cut point.
-- `systemPrompt` and `toolSpecs` are the live conversation's, passed through unchanged, because a compaction request must match the prefix the thinking blocks are bound to. The default ignores them.
-- `instructions` carries the strategy's custom summarization prompt (`SummarizeConfig.systemPrompt`). The default uses it as the summarizer's system prompt; Anthropic sends it as `compaction.instructions`.
-
-Both the default and every override pick the cut with one shared helper, `compactionSplitIndex`. It moves the cut *back* to a user-prompt boundary, so the preserved tail can grow but never shrinks, a `toolUse` is never separated from its `toolResult`, and pinned messages are never summarized. The client-side cut in `BaseOffloadStrategy` instead moves *forward* across a split pair and summarizes the newest exchange (see "Repeated Server-Side Compaction and Custom Instructions"), so the default doesn't reuse it.
-
-In Python the signature is `compact(messages, *, preserved_messages=0, tool_specs=None, system_prompt=None, instructions=None)`.
-
-```typescript
-export abstract class Model<T extends BaseModelConfig = BaseModelConfig> {
-  // ...existing fields and methods
-
-  /**
-   * Summarizes the older messages and keeps the most recent ones verbatim.
-   *
-   * The default is a client-side summary generated by this model. Providers with server-side
-   * compaction override it.
-   *
-   * @param messages - Full conversation history; `compact` picks the cut point from `preservedMessages`.
-   * @param options - `preservedMessages` (count, or ratio in (0, 1), of trailing messages to keep verbatim),
-   *   `systemPrompt` and `toolSpecs` (the live conversation's, passed through unchanged), and
-   *   `instructions` (a custom summarization prompt).
-   * @returns `[summary message, ...preserved messages]`, or `undefined` if there was nothing to compact.
-   */
-  async compact(messages: Message[], options: CompactOptions = {}): Promise<Message[] | undefined> {
-    const split = compactionSplitIndex(messages, options.preservedMessages ?? 0)
-    if (split <= 0) return undefined
-    const summary = await generateSummary(this, messages.slice(0, split), options.instructions)
-    return [summary, ...messages.slice(split)]
-  }
-}
-```
-
-#### `AnthropicModel.compact()`
-
-The override decides from the model's metadata, using the "unknown means try" rule from the metadata design:
-
-| `capabilities.serverCompaction` | `AnthropicModel.compact()` |
-|---|---|
-| `true` | Native compaction. |
-| `undefined` (unknown) | Tries native compaction. If the API rejects the `compaction` parameter or beta, it records `serverCompaction: false` as a learned fact and continues as `false`. |
-| `false` | Client-side summary through `super.compact()`, unless `reasoning.historyBound` is `true`. |
-
-Two rules keep the override from silently losing thinking. Token counting falls back to `super` on any error, because a wrong estimate is harmless. A client-side summary on a history-bound model invalidates every preserved thinking block, so compaction can't fall back the same way:
-
-1. **Only a capability rejection is learned.** A timeout, throttle or 5xx is a failed request, not an answer about the model. `compact()` logs a warning and returns `undefined`, so the history is unchanged and the strategy tries again the next time it runs.
-2. **No client-side fallback on a history-bound model.** When `serverCompaction` is `false` and `reasoning.historyBound` is `true`, `compact()` logs a warning and returns `undefined` rather than calling `super.compact()`. The client-side options that stay valid on these models (see "Client-side summarization that stays valid on preserved-thinking models") are the candidate replacement.
-
-The native implementation is in "Anthropic code changes in appendix for API implementation".
-
-Once the history holds a compaction block, `AnthropicModel.stream()` and `countTokens()` send it through `beta.messages` with the compaction beta, because the non-beta endpoint rejects a `compaction` content block. This switch depends on the history, not on `serverCompaction`, so a conversation that never compacted keeps using the regular endpoint.
-
-**Before the metadata design lands.** Part 1 doesn't have to wait for #5305. Until then, `AnthropicModel` answers `serverCompaction` from a private list of preserved-thinking model ids (Claude Fable 5.1, Opus 5.5, Sonnet 5.5, Haiku 5.5) and an `AnthropicModelConfig.serverCompaction` override for gateways and new ids, the same way `use_native_token_count` gates native token counting. When #5305 lands, the list moves into `declareMetadata()` and the override into the `metadata` config key.
-
-#### `SummarizeStrategy`
-
-The strategy decides *when* to compact; the model decides *how*. A message-level summary always goes through `model.compact()`. `BaseOffloadStrategy` gains `_isRetroactive`, a field for whether a strategy edits content the model has already seen, and skips text blocks that carry `providerData` (see "Storing the compaction as a summary"):
-
-```typescript
-export abstract class BaseOffloadStrategy implements ContextStrategy {
-  // ...existing fields and methods
-
-  /**
-   * Whether this strategy edits content the model has already seen.
-   * Eager per-block offloading rewrites a message before the next model call, so it never is.
-   */
-  protected readonly _isRetroactive: boolean
-
-  constructor(target?: OffloadTarget, conditions?: OffloadConditions) {
-    // ...existing assignments
-    this._isRetroactive = this._isMessageLevel || this._preserveRecent > 0
-  }
-
-  protected _blockMatchesTarget(block: ContentBlock, message: Message, toolNameMap: Map<string, string>): boolean {
-    // ...existing ToolUseBlock, CachePointBlock, ReasoningBlock exclusions
-    if (block instanceof TextBlock) {
-      // A block with providerData is round-tripped verbatim; editing it breaks the provider's signature.
-      if (block.providerData !== undefined) return false
-      return targetMatchesMessage(this._target, message)
-    }
-    // ...existing tool result and media handling
-  }
-}
-```
-
-`_isRetroactive` is set once in the constructor, next to the other `OffloadConditions` fields ([`base.ts`](https://github.com/strands-agents/harness-sdk/blob/main/strands-ts/src/context-manager/strategies/offload/base.ts#L330-L343) / `base.py`). A message-level strategy always rewrites history the model has already seen. A per-block strategy does too when `preserveRecent > 0`, because the preserved blocks were already sent.
-
-A retroactive per-block summary is the one case where the strategy reads the metadata. On most models it should stay a per-block summary, so it calls `compact()` only when `serverCompaction` is `true`, and otherwise keeps its current behavior.
-
-Auto mode's tool-result truncation runs eagerly, when the result is added and before the model sees it, so it doesn't affect preserved thinking. A truncate strategy with `preserveRecent > 0` instead truncates results the model has already seen, which invalidates later thinking blocks. Part 2 covers it.
-
-```typescript
-export class SummarizeStrategy extends BaseOffloadStrategy {
-  // ...existing fields and methods
-
-  override async apply(context: ContextState): Promise<boolean> {
-    const model = this._resolveModel(context.agent) // this._config.model ?? context.agent.auxModel
-    if (!model) {
-      logger.warn('no model available for summarization')
-      return false
-    }
-    if (this._isMessageLevel) {
-      if (!context.overflow && context.utilization < this._utilizationThreshold!) return false
-      return this._compact(context, model)
-    }
-    if (this._isRetroactive && model.metadata.capabilities.serverCompaction === true) {
-      return this._compact(context, model)
-    }
-    return super.apply(context)
-  }
-
-  /** Replaces the history with `model.compact()`'s result. */
-  private async _compact(context: ContextState, model: Model): Promise<boolean> {
-    const { messages, agent } = context
-    const compacted = await model.compact(messages, {
-      preservedMessages: this._preserveRecent,
-      // A compaction request must carry the live system prompt and tools, or the
-      // provider rejects it as a different conversation.
-      ...(agent.systemPrompt !== undefined && { systemPrompt: agent.systemPrompt }),
-      toolSpecs: agent.toolRegistry.list().map((tool) => tool.toolSpec),
-      ...(this._config.systemPrompt !== undefined && { instructions: this._config.systemPrompt }),
-    })
-    if (!compacted) return false // nothing compacted, so leave the history unchanged
-
-    messages.splice(0, messages.length, ...compacted) // [summary message, ...recent]
-    return true
-  }
-}
-```
-
-### Compaction request settings
-
-On-demand compaction (`compact-2026-09-04`) has one setting besides `type`, and Strands fills in the rest from the strategy and the model:
-
-| Setting | How Strands sets it |
-|---|---|
-| `compaction.instructions` (up to 16,384 characters) | From `SummarizeConfig.systemPrompt`. It replaces Anthropic's default summarization prompt entirely, so it should say what the summary must keep and tell the model not to call tools. |
-| When to compact | There's no API setting: on-demand compaction runs when the request is sent. `Offload.summarize(...).when({ utilization, preserveRecent })` decides when to compact and where to cut. |
-| `max_tokens` | The model's `max_tokens`. It caps the whole summarization call, including thinking. A summary that hits the cap comes back empty (`stop_reason: "max_tokens"`), and `compact()` leaves the history unchanged. |
-
-There is no setting for summary length; `instructions` is the only way to steer it. The compaction request also uses the conversation's model, `system`, `tools`, and thinking settings, and the API rejects `stop_sequences`, `output_config.format`, and a forced `tool_choice` on it.
-
-Threshold compaction (`compact_20260112`, beta `compact-2026-01-12`) has more settings: `trigger` (input tokens, default 150,000, minimum 50,000), `pause_after_compaction`, and `instructions`. Strands doesn't use it. On preserved-thinking models, thinking from before its compaction block isn't carried forward, so turns kept after the block lose their thinking. It also can't be combined with on-demand compaction on one request.
-
-### Anthropic models on Bedrock
-
-The two ways to run Claude on Bedrock behave differently:
-
-- **`AnthropicModel` with a Bedrock client** is supported. Native compaction worked through `AsyncAnthropicBedrock` (Bedrock's InvokeModel endpoint) in all 36 native runs of the eval in "Server-Side Compaction Performance with Different `aux_model`". Anthropic's documentation doesn't list Bedrock for on-demand compaction, so it isn't confirmed that this support is intended or stable. In TypeScript the Bedrock client is passed as `client`. In Python, `AnthropicModel` only builds an `AsyncAnthropic` client from `client_args`, so a Bedrock client has to be assigned to `model.client` after construction. A first-class way to pass it is a candidate follow-up.
-- **`BedrockModel` (Converse API)** is not supported. Converse has no `compaction` parameter or content block, so `BedrockModel` doesn't override `compact()`. If a history compacted by `AnthropicModel` is later sent through `BedrockModel`, the summary goes out as plain text: the preserved turns' thinking then fails the binding check (400 under `prefix_mismatch_behavior: "error"`), and the request succeeds under `drop_block` (see "Sending the compaction summary as text vs. as the signed block"). `BedrockModel` declares `serverCompaction: false`, because the Converse wire format can't carry it, so its `compact()` is the client-side default. `BedrockModel` customers can use the client-side options in "Client-side summarization that stays valid on preserved-thinking models".
-
-### Summarize Server Side through Compaction
-
-Anthropic's answer to vended context modification is compaction. The public surface, `Offload.summarize(target).when({ utilization, preserveRecent })`, does not change. Behind it, `apply()` resolves the model as it does today (`this._config.model ?? agent.auxModel`) and calls that model's `compact(...)`. On `AnthropicModel` with a model that supports it, that is native compaction; everywhere else it is the client-side summary. A customer who set `agent.auxModel` is still routed there, and `agent.model` is never read directly. `compact()` takes the customer's existing conditions as-is, so there is no second API to learn.
-
-If the strategy was configured with a custom `systemPrompt`, `compact()` sends it as the compaction request's `instructions`. It can't replace the request's `system`, which must match the live conversation for the thinking blocks to stay valid.
-
-Anthropic rejects a compaction request whose system prompt or tools differ from the live conversation.
-
-#### Implementation: Part 1 
-
-For part 1 of this fix we will focus on the `Summarizer` implementation for the case when server side compaction must be utilized in. 
-
-**Scope of Part 1**: the only behavior change is inside the summarizer path (`SummarizeStrategy` and `Model.compact()`). On an `AnthropicModel` whose `serverCompaction` is `true` or unknown, a summary goes through Anthropic's native compaction; on every other model, the client-side summary is unchanged except for the corrected cut point. Tool list mutation and system prompt mutation (Implementation: Part 2, below) are explicitly out of scope here — those paths are untouched by Part 1 and will still error, or silently drop thinking blocks, on preserved-thinking models until Part 2 is designed.
-
-#### Storing the compaction as a summary
-
-Anthropic allows LLM users to call Claude Native API to "compact" a conversation. Compacting does not allow for the amount of control that the Strands SDK provides in terms of summarizing a re-shaping context. In order to avoid dropping thinking blocks, Strands needs to use Anthropic's `compact` function to modify the context otherwise 400 errors will be returned by Anthropic. 
-
-Strands stores the result of a native compaction as an ordinary summary: an assistant message with one `TextBlock` whose `text` is the provider's summary. No new content-block type is added, so customers reading `agent.messages` (hooks, session storage, UIs) see a text block they already handle, and no provider needs its own compaction block.
-
-The summary text alone is not enough. Anthropic only keeps the preserved turns' thinking valid when it receives the signed compaction block it issued, unchanged; the same text sent as a plain text block returns a 400 (see "Sending the compaction summary as text vs. as the signed block"). So `TextBlock` gains one optional field for opaque provider state:
-
-```typescript
-/**
- * Opaque provider state bound to the content block that carries it.
- *
- * Only the provider named by `provider` reads `data`; every other provider ignores it and sends
- * the block as usual. Round-tripped verbatim, so a block carrying it must not be edited.
- */
-export interface ProviderData {
-  /** The provider that produced `data`, such as `'anthropic'`. */
-  provider: string
-
-  /** Provider-defined payload, sent back unchanged. */
-  data: Record<string, JSONValue>
-}
-
-export interface TextBlockData {
-  text: string
-
-  /** Opaque provider state bound to `text`. */
-  providerData?: ProviderData
-}
-```
-
-Python's `ContentBlock` TypedDict gains the equivalent `providerData: ProviderData` key, next to `text` in the same dict. For an Anthropic compaction the block is:
-
-```python
-{
-    "text": "<Anthropic's summary>",
-    "providerData": {"provider": "anthropic", "data": {"type": "compaction", "signature": "...", "encrypted_content": "..."}},
-}
-```
-
-This follows an existing precedent: `ToolUseBlock.reasoningSignature` carries Gemini's thought signature, an optional field on an existing block that only the providers that need it read.
-
-Four rules keep it valid:
-
-1. **Only the producing provider reads it.** `AnthropicModel` sends a text block with Anthropic compaction `providerData` as `{ ...data, content: text }`, which is the signed `compaction` block. Every other provider ignores the field and sends plain text.
-2. **Strategies never edit it.** `_blockMatchesTarget` / `_block_matches_target` skip any text block with `providerData`. Editing the text returns 400 `content does not match its signature`.
-3. **Serialization keeps it.** `TextBlock.toJSON`/`fromJSON` carry `providerData`, so a session restore sends the same signed block. Python dicts keep the key already.
-4. **`text` is the only copy of the summary**, so the text and the payload can't drift apart.
-
-**Backwards compatibility.** The change is additive: an optional field on an existing block (and an optional second argument to the `TextBlock` constructor in TypeScript). Code that switches over content-block types needs no new case, and code that reads `text` sees the summary. Stored sessions without the field load as before.
-
-**How it differs from a client-side summary in `agent.messages`.** The native summary has no `[Summarized: …]` header, because `formatSummarized` / `_format_summarized` aren't called on the native path. It is its own assistant message at index 0 rather than a marker added at index 1 or later. It carries `providerData`, and per-block strategies skip it. Re-summarizing it means another native compaction, which takes the old summary as input.
-
-
-#### API Changed in Model Class
-
-`Model` gains one method and no config field:
-
-- **`Model.compact()`**, concrete, defaulting to a client-side summary. `AnthropicModel` is the only provider that overrides it today.
-- **`capabilities.serverCompaction`** in `Model.metadata` (from #5305) says whether the model supports server-side compaction. `true` for Claude Fable 5.1, Opus 5.5, Sonnet 5.5 and Haiku 5.5, `false` for providers whose wire format can't carry it, and unknown otherwise.
-- **`capabilities.reasoning.historyBound`** (also from #5305) says whether a client-side summary would invalidate the model's thinking. `AnthropicModel.compact()` reads it before falling back to `super.compact()`.
-
-`AnthropicModelConfig` gains a temporary `serverCompaction?: boolean` override until #5305 lands (see "Before the metadata design lands").
-
-#### Codebase changes
-
-Where is the "path" checked in the codebase for summarize to function normally to users?
-
-- python: `strands/_context_manager/strategies/offload/base.py` (`BaseOffloadStrategy.__init__` sets `_is_retroactive`; `_block_matches_target` skips blocks with `providerData`) and `strands/_context_manager/strategies/offload/summarize.py` (`SummarizeStrategy.apply` calls `model.compact()`). `strands/models/model.py` adds the default `Model.compact()` and the shared cut helper. The provider call lives in `strands/models/anthropic.py` (`AnthropicModel.compact` writes `providerData`; `_format_request_message_content` and `_compaction_split` read it through `_is_compaction`). `strands/types/content.py` adds `ProviderData` and the `providerData` key on `ContentBlock`.
-- typescript: `strands-ts/src/context-manager/strategies/offload/base.ts` (`BaseOffloadStrategy` constructor sets `_isRetroactive`; `_blockMatchesTarget` skips blocks with `providerData`) and `strands-ts/src/context-manager/strategies/offload/summarize.ts` (`SummarizeStrategy.apply`). `strands-ts/src/models/model.ts` adds the default `Model.compact()` and the shared cut helper. The provider call lives in `strands-ts/src/models/anthropic.ts` (`AnthropicModel.compact` writes `providerData`; the request formatter and `compactionSplitIndex` read it through `isCompaction`). `strands-ts/src/types/messages.ts` adds `ProviderData` and `TextBlock.providerData` (kept by `toJSON`/`fromJSON` and `contentBlockFromData`), exported from `strands-ts/src/index.ts`.
-
-
-### Implementation: Part 2
-
-Part 2 will focus on implementing some of the server-side context management techniques that Anthropic allows through their API. Part 1 moves summarization to its server-side form. Part 2 does the same for the other Strands techniques that edit history the model has already seen. Each of them invalidates every later thinking block when done client-side, and each has an append-only or server-side form on preserved-thinking models.
-
-| Strands technique today | Server-side form | Beta |
-|---|---|---|
-| Retroactive tool-result truncate or drop, and the agentic `truncate_context` tool | `clear_tool_uses_20250919` context edit | `context-management-2025-06-27` |
-| None (offload strategies skip `ReasoningBlock`) | `clear_thinking_20251015` context edit | `context-management-2025-06-27` |
-
-#### Clearing Tool Uses
-
-Anthropic's [context editing](https://platform.claude.com/docs/en/build-with-claude/context-editing) clears old tool results on the server with the `clear_tool_uses_20250919` edit. The API applies the edit to the request only, and Strands keeps the full history, so nothing the model has already seen is rewritten. Anthropic's docs state that server-side context management doesn't invalidate thinking blocks on Claude Fable 5.1, Opus 5.5, Sonnet 5.5, and Haiku 5.5. Context editing is available on every platform, Bedrock included.
-
-It would replace the retroactive tool-result strategies: `Offload.truncate` and `Offload.drop` with `preserveRecent > 0` or a `utilization` condition, and the agentic `truncate_context` tool. The strategy conditions map onto the edit's settings:
-
-| Strands | `clear_tool_uses_20250919` |
-|---|---|
-| `utilization` | `trigger: { type: "input_tokens", value: utilization × contextWindowLimit }` (default 100,000) |
-| `preserveRecent` | `keep: { type: "tool_uses", value: N }` (default 3) |
-| Tool exclusion filter | `exclude_tools` |
-| Target includes tool inputs | `clear_tool_inputs: true` |
-| None | `clear_at_least: { type: "input_tokens", value: N }`, so each clear frees enough to pay for the prompt-cache rewrite |
-
-Unlike compaction, this is a per-request setting, not a history change. The strategy doesn't edit `messages`. It adds an entry to the request's `context_management.edits`, and `AnthropicModel` sends it on every request. That needs a hook next to `compact()`, for example a model method that takes the active edits, or edits carried on `ContextState`.
-
-Gaps:
-
-- Strands' tool include filter has no API equivalent. `exclude_tools` is an exclusion list only, so an include filter would have to be inverted against the tool registry.
-- The server's placeholder text can't carry Strands' stash references, so the retrieval tool can't point back to cleared content.
-- `context_management` can't be sent on an on-demand compaction request, so `compact()` must leave it off.
-
-The response reports what the server cleared in `context_management.applied_edits` (`cleared_tool_uses`, `cleared_input_tokens`), which Strands should log next to the `input_transformations` drops Part 1 already reports.
-
-#### Clearing Thinking
-
-The `clear_thinking_20251015` edit clears thinking blocks from older assistant turns on the server. Strands has no thinking-reduction strategy today; offload strategies skip `ReasoningBlock` on purpose. This edit would let customers trim old reasoning tokens without invalidating anything.
-
-It has one setting, `keep: { type: "thinking_turns", value: N }` or `"all"`. On the 5.5 models the default is `"all"`, so a strategy has to set `keep` explicitly to clear anything. Clearing invalidates the prompt cache from the clear point onward, so `keep` trades context space against cache hits. When both edits are sent, `clear_thinking_20251015` must come first in `edits`. Cleared turns are reported in `context_management.applied_edits` (`cleared_thinking_turns`, `cleared_input_tokens`), the same as tool-use clearing.
-
-### Implementation: Part 3
-
-Server-side summarization through compaction with additional model providers.
-
-OpenAI compaction uses the same `providerData` field with `provider: 'openai'`, so no new block type is needed. Open item: if OpenAI's compaction output has no readable summary text, the block would be an empty `text` with opaque `data`, and other providers would need to drop it rather than send an empty text block. OpenAI's actual output shape hasn't been checked yet.
-
+### Recommended: Split base and native summarizers behind a pure cut
+
+#5470 is reworked into this split (#5733), so `Model.summarize()` never ships and needs no deprecation. All interfaces below are a proposed API.
+
+1. **Resolve.** `summarizer_model = config.model or agent.aux_model`. `resolve(agent)` returns `NativeSummarizer` when `summarizer_model.model_info.capabilities.server_side_compaction is True`; `False` or `None` returns `BaseSummarizer`. Providers declare the value and developers override it through `model_info`. Wrappers report the inner model's `model_info`. No method-identity checks.
+2. **Cut.** `plan_cut(messages, keep_head)` reads `preserve_recent` from the config and returns `Cut(head, body, tail)`. It's a pure function: tool pairs stay whole, roles alternate at the body/tail boundary, it stops at the first pin, and an earlier summary rolls into `body`. Each summarizer carries its own `keep_head`: base 1, native 0.
+3. **Summarize.** `BaseSummarizer` sends `cut.body`, flattened, with the summarizer prompt and no live system or tools, through `model.stream`. `NativeSummarizer` sends `head + body` (starting at message 0) with live system and tools to `Model.compact()`; the tail isn't sent. If `compact()` returns `None`, the strategy re-cuts with `keep_head = 1` and runs the base path in the same pass.
+4. **Result.** `SummaryResult.block` is a `TextBlock` with `metadata.offloaded = {method: "summarize"}`. Only native results carry `providerData` (#5402).
+5. **Place.** `head + [summary] + tail`, never joined, so `merged_messages` goes away. On the native path the block is first, and `place()` records message 0 for re-statement.
+6. **Render.** One shared pre-format step merges adjacent same-role messages for the wire without changing stored history. `metadata` never reaches the wire; `providerData` reaches only its own provider and renders as plain text elsewhere.
+7. **Stale thinking.** Reactive `drop_block` stays the default. Where `block_binding` is unavailable, the provider strips the stale thinking itself. Dropped blocks are reported as a metric.
+
+**Pros:**
+
+- Removes all three root causes: one contract per summarizer, metadata instead of header matching, no joins.
+- `plan_cut` is pure and property-testable in both SDKs, and the fuzz corpus from #5736 runs against it directly.
+- A Haiku 5.5 `aux_model` can compact for Sonnet 5.5, which Anthropic documents as accepted.
+- Thinking invalidation stays inside providers; the strategy never inspects reasoning blocks.
+
+**Cons:**
+
+- The wire for the base path is unchanged, but stored history now holds adjacent same-role messages (message 0 and a user-role summary), so every reader of `agent.messages` sees a new shape (O6).
+- Native compaction replaces message 0 until mid-conversation system messages land (#5176), which is why native stays opt-in until then (O2).
+- Stopping the cut at the first pin can summarize less than #5470 when a pin sits early (O3), and message-level target filters such as `"tool_results"` select non-contiguous messages that a contiguous `body` can't express (O4).
+- Native behavior on Bedrock paths is undocumented or untested live (O1).
+- Also affected by O5, O7, O9, O10.
+
+### Alternative: Incremental routing (a), provider-owned placement (b), or always-strip (c)
+
+- **(a) Merge #5470 and route on capability.** Keep `Model.summarize()`, replace the function-identity check with `server_side_compaction`, add a `providerData` guard to `_is_text`, and fix #5736 in the planner.
+- **(b) Provider-owned placement.** The original version of this design: `Model.compact()` returns `[summary, ...preserved]` and each provider picks the cut and placement with a shared `compactionSplitIndex` helper, as specified in #5464.
+- **(c) Always strip on the base path.** Native where available; on the base path, strip the tail's thinking before every request instead of relying on the reactive retry.
+
+- **Pros:**
+  - (a) Least new API. The code exists, passes its unit tests (Python 340, TS 214), and each fix is local.
+  - (b) The provider owns its placement rules, so strategy code can't produce `compaction_block_misplaced`. One method covers both operations, matching the `count_tokens()` pattern.
+  - (c) The base path never sends a stale block, the `between_tools` gap closes the same way as every other case, and behavior no longer depends on account creation date.
+- **Cons:**
+  - (a) Root causes 2 and 3 remain: header matching and neighbor joining stay, so every planner fix still touches role selection and offsets in both SDKs. It ships an experimental API this design would replace one release later.
+  - (b) Each provider, including third-party ones, reimplements pin and tool-pair rules or calls a shared helper it can bypass. The strategy can't see what was summarized, so stash refs, usage accounting, and pins need a second channel back out.
+  - (c) Discards tail reasoning even on accounts and models that wouldn't reject it, invisibly (`display: "omitted"`). It reverses the decision to keep reactive `drop_block` as the default.
 
 ## Developer Experience
 
-The goal of this design is to allow Strands users to use the context management techniques with any LLM, and preserved thinking should not effect this. 
+Configuration is the existing strategy plus an optional summarizer model. All code is a proposed API; model IDs are placeholders.
 
-The Developer Experience is unchanged. On an Anthropic preserved-thinking model (Claude Fable 5.1, Haiku 5.5, Sonnet 5.5, and Opus 5.5 for now), summarization has to happen server-side, and `AnthropicModel` does that on its own because the model's metadata says it supports server-side compaction:
+```python
+sonnet = AnthropicModel(model_id="<sonnet-5.5-id>")
+haiku = AnthropicModel(
+    model_id="<haiku-5.5-id>",
+    # Opt in before the default flips (see Rollout).
+    model_info=ModelInfo(capabilities=ModelCapabilities(server_side_compaction=True)),
+)
+agent = Agent(model=sonnet, aux_model=haiku)  # SummarizeConfig(model=...) overrides aux_model
+strategy = Offload.summarize("*").when(utilization=0.7, preserve_recent=3)
 
-```typescript
-import { Agent } from '@strands-agents/sdk'
-import { Offload } from '@strands-agents/sdk/experimental'
-import { AnthropicModel } from '@strands-agents/sdk/models/anthropic'
+converse = BedrockModel(model_id="<bedrock-model-id>")  # server_side_compaction=False -> base path
+sonnet.client = AsyncAnthropicBedrockMantle(...)        # Mantle or InvokeModel: test-only today
+```
 
-const agent = new Agent({
-  model: new AnthropicModel({
-    modelId: 'claude-fable-5-1',
-    params: { thinking: { type: 'adaptive' } },
-  }),
-  contextManager: {
-    strategies: [
-      // Unchanged: on this model, summarization is routed to AnthropicModel.compact()
-      Offload.summarize('*').when({ utilization: 0.8, preserveRecent: 4 }),
-    ],
-  },
+```ts
+const haiku = new AnthropicModel({
+  modelId: '<haiku-5.5-id>',
+  modelInfo: { capabilities: { serverSideCompaction: true } },
 })
+const agent = new Agent({ model: sonnet, auxModel: haiku })
+const strategy = Offload.summarize('*').when({ utilization: 0.7, preserveRecent: 3 })
 ```
 
-A custom summarization prompt works the same on both paths. On this model it becomes the compaction request's `instructions`:
+- **Routing.** `True` uses native compaction. `False` or unknown uses the base summary, which keeps message 0 and stores the summary after it.
+- **Fallback.** If `compact()` returns `None` (for example, a path without on-demand compaction), the same pass re-cuts with message 0 kept and writes a base summary. No error reaches the caller.
+- **Reading history.** A summary is `block.metadata.offloaded.method == "summarize"`, never a text prefix.
 
-```typescript
-Offload.summarize('*', { systemPrompt: 'Keep file paths and decisions.' }).when({ utilization: 0.8, preserveRecent: 4 })
+Warning when reasoning is dropped:
+
+```
+model_id=<sonnet-5.5-id> | history edit invalidated replayed thinking blocks, retrying with drop_block
 ```
 
-For a model id Strands doesn't know yet, or a gateway that strips the compaction beta, the user overrides the metadata. Before #5305 lands, the same override is `serverCompaction` on `AnthropicModelConfig`:
-
-```typescript
-new AnthropicModel({
-  modelId: 'claude-new-model',
-  metadata: { capabilities: { serverCompaction: true } }, // or false behind a gateway
-})
-```
-
-Without native compaction, a client-side summary on these models fails the next request with a 400, because the kept thinking blocks no longer match the conversation that produced them. That's why `AnthropicModel.compact()` leaves the history unchanged instead of falling back to one on a history-bound model.
-
-## Open Questions
-
-- [ ] **Part 2 entry points.** Following `compact()`, each Part 2 technique could be its own `Model` method with a client-side default (for example, one that takes the active context edits), gated by its own metadata capability. Is a method per technique the right shape, or should Part 2 edits be carried on `ContextState` for the provider to read?
-
-- [ ] **Which model's `historyBound` decides the fallback?** `AnthropicModel.compact()` reads its own metadata, but the thinking at risk belongs to `agent.model`. If `agent.auxModel` is a different provider than the main model (for example, a Bedrock Nova summarizer for an Opus 5.5 agent), the default `compact()` runs a client-side summary and the Opus thinking is invalidated. Should the strategy check `agent.model`'s `historyBound` before calling a non-native `compact()`?
-
-- [ ] **Dependency on #5305.** Ship Part 1 with the temporary `AnthropicModelConfig.serverCompaction` override, or wait for `Model.metadata`?
-
-- [ ] **How should the context injector add per-turn content on preserved-thinking models?** Part 2 proposes system messages with `clear_at: "next_user_message"`. Confirm that fits the injector before it's built.
-
-- [ ] **Should summaries be incremental?** On-demand compaction can compact a history that already starts with a compaction block, summarizing the old summary plus newer turns. Should Strands compact more often in smaller steps to keep more detail, rather than once at the utilization threshold?
-
-
-## Alternative: Recompute `_isRetroactive` via a getter
-
-Instead of deriving `_isRetroactive` once in the constructor, `BaseOffloadStrategy` could expose it as a getter that re-derives the value from `OffloadConditions` on every `apply()` call.
-
-- **Pros:** Keeps `apply()` as the single place that reasons about the strategy's conditions; nothing to keep in sync if a subclass mutated its conditions after construction.
-- **Cons:** `OffloadConditions` fields (`threshold`, `utilization`, `preserve_recent`) are already read exactly once, at construction, into `readonly` fields — a getter would recompute a value from inputs that never change after `__init__`/the constructor runs, which is both wasted work and inconsistent with how every other derived field on the strategy is handled. Rejected in favor of a plain field set once in the constructor.
-
-## Alternative: A `requiresServerSideCompaction` flag on `BaseModelConfig`
-
-A boolean on every model's config, checked by `SummarizeStrategy`, which calls a `compact()` that throws by default when the flag is set and generates a client-side summary when it isn't.
-
-- **Pros:** Explicit. Nothing changes unless the user sets the flag.
-- **Cons:** Every user of a preserved-thinking model has to know to set it, and forgetting it means a 400 on the first summary. The strategy has to know about the provider capability, and a provider that can't compact (Bedrock Converse) still accepts the flag and fails at compaction time. It can't represent "unknown, try it", and it's one of the per-feature flags the model metadata design replaces. Rejected in favor of an overridable `compact()` gated by `capabilities.serverCompaction`.
-
-## Alternative: Abstract `Model.compact()` implemented by every provider
-
-`compact()` could be declared `abstract` on `Model`, forcing every provider subclass to implement it.
-
-- **Pros:** The type system guarantees every provider made a choice.
-- **Cons:** Every provider without server-side compaction would copy the same client-side summary. A concrete default on `Model` gives them that for free, as `countTokens()` does for token estimates.
-
-## Alternative: A dedicated `CompactionBlock` content type
-
-Instead of a field on `TextBlock`, Strands could add a `CompactionBlock` to the content-block union (`{ content?, signature?, encryptedContent? }`, mirroring Anthropic's `BetaCompactionBlock`), with a matching `compaction` key on Python's `ContentBlock`.
-
-- **Pros:** The type system makes every provider and strategy handle the block explicitly, so a code path can't drop the signature by rebuilding a `TextBlock` from its text.
-- **Cons:** It widens the public content-block union, so customers who switch over block types or read `agent.messages` get a type they've never seen. Each additional provider with server-side compaction could need its own block shape, and every provider that can't send the block has to reject or convert it (`BedrockModel` would throw). Rejected in favor of an optional `providerData` field on the existing `TextBlock`.
-
-## Alternative: Store only the summary text, without the signature
-
-Strands could keep the compaction's `content` as a plain text summary and discard the signature, so nothing provider-specific is stored at all.
-
-- **Pros:** No new field; the native summary is indistinguishable from a client-side one.
-- **Cons:** The next request returns a 400 whenever a thinking block from before the compaction is still in the preserved turns, because the API can't tell the text apart from a summary Strands wrote itself (see "Sending the compaction summary as text vs. as the signed block"). Avoiding the 400 then needs `drop_block`, stripping thinking from the preserved turns, or `preserveRecent: 0`, which all lose the preserved reasoning. At that point native compaction offers nothing a client-side summary from `agent.auxModel` doesn't. Rejected.
-
-## Alternative: Categorizing Prefixes as Protected? 
-
-## Alternative: Drop Thinking Blocks
-
-Anthropic does not recommend
-
-
+| Error | Cause | Handling |
+|---|---|---|
+| 400 `compaction_block_misplaced` | summarized messages in front of the block | `place()` puts the block first |
+| 400 "bound to a different conversation" | replayed thinking after a history edit | provider retries once with `drop_block` |
+| `between_tools` gap | retry can't apply | provider strips stale thinking (proposed) |
+| `TypeError` on `params={"compaction": ...}` | not a supported parameter | use `extra_body` today; first-class in #5401 |
 
 ## Additional Details
 
 <details>
-<summary>Client-side summarization that stays valid on preserved-thinking models</summary>
+<summary>Extended context</summary>
 
-Server-side compaction is not the only way to summarize on a preserved-thinking model. Anthropic's [preserved thinking docs](https://platform.claude.com/docs/en/build-with-claude/preserved-thinking) also describe client-side summaries that pass the prefix check. This is a candidate fallback for when `Model.compact()` is unavailable (Bedrock, a proxy or gateway, or a failed compaction request), instead of leaving the history unchanged.
+### Rollout
 
-**Why a client-side summary normally fails.** Each thinking block is checked against the `system`, `tools`, and `messages` that came before it when it was generated. A keep-tail summary (summarize the older turns, keep `preserveRecent` turns verbatim) replaces the history the kept turns' thinking was generated against, so those blocks fail. Anthropic calls this out directly: "If you write the summary yourself, the kept turns' thinking fails the check, because those blocks were produced against the history you replaced."
+The goal is no change for users who don't opt in until each step is safe.
 
-**Thinking generated after the summary is valid.** New thinking is bound to the compacted history, not the original. From the docs: "Thinking the model produces from this request onward follows the summary and stays valid." Only the blocks that were already in the history before the swap fail.
+1. **Split lands (#5733).** `AnthropicModel` declares `server_side_compaction=None`, so everyone takes the base path. Stored summaries change shape (metadata, separate message); the wire for the base path doesn't. Old sessions keep loading (see Decisions needed, D3).
+2. **Native lands (#5401).** Opt-in only, through `model_info`. Opting in accepts that message 0 is replaced by the summary.
+3. **Re-statement lands (#5176, then `restate_head`).** `AnthropicModel` declares `True` for preserved-thinking model IDs. From here, preserved-thinking users get native compaction by default, with message 0 re-stated. Docs (#5405) call out the behavior and cost change.
 
-**Three ways to summarize client-side without a 400:**
+### Anthropic compaction rules
 
-1. **Simple compaction (Anthropic's recommendation for client-side compaction).** Replace the entire history with one user message containing the summary and the next instruction. No earlier thinking is replayed, so nothing is checked.
+From [compaction-on-demand](https://platform.claude.com/docs/en/build-with-claude/compaction-on-demand) and [compaction-thinking-blocks](https://platform.claude.com/docs/en/build-with-claude/compaction-thinking-blocks):
 
-    ```json
-    [{ "role": "user", "content": "<summary of the session so far>\n\n<the next instruction>" }]
-    ```
+- On-demand compaction (top-level `compaction: {type: "summarize"}`) returns one compaction block: summary text plus a signature.
+- The block must be first in `messages`; summarized messages left in front of it cause 400 `compaction_block_misplaced`.
+- A later request can use a different system, tools, or model from the compaction request. Haiku 5.5 can compact for Sonnet 5.5, but can't read Sonnet 5.5's thinking, so the summary is written without it.
+- Kept turns' thinking stays valid when the compaction ran on a preserved-thinking model, the kept turns directly follow the summarized ones unchanged, the first kept message differs in role from the last summarized one and isn't `role: "system"`, and system and tools are unchanged.
+- To keep an instruction in force, re-state it as a `role: "system"` message directly after the first new user turn that follows the kept turns. A system message between the block and the kept turns breaks their thinking.
+- A model switch never causes a 400. Blocks the current model can't read are dropped (`model_binding_mismatch`) with a 200.
 
-2. **Keep-tail with thinking stripped.** Summarize the older turns as today, then remove `thinking` and `redacted_thinking` blocks (Strands' `ReasoningBlock`) from the preserved messages, keeping their `text` and `toolUse` blocks. Removing all thinking blocks is a valid edit, so this works without any beta header. This matches `preserveRecent` most closely.
+### Provider paths
 
-3. **Keep-tail with `drop_block`.** Leave the history as-is and send `thinking.block_binding.prefix_mismatch_behavior: "drop_block"` (beta `thinking-binding-controls-2026-08-01`). The API drops the failing blocks and reports them in `input_transformations`. The setting must stay on for as long as the kept turns remain in history.
+Documented support (docs fetched 2026-11-02):
 
-**Cost.** All three lose the reasoning in the summarized or kept turns, once per compaction, and the model regenerates what it needs. Anthropic measured `drop_block` firing once per session at +2.5% (low effort) to +20.1% (max effort) output tokens on a multi-turn coding benchmark, and +4.6% to +67.1% when firing on every turn. A single strip at compaction time is closest to the once-per-session figure.
-
-**Conditions for the new thinking to stay valid:**
-
-- The summary message is sent unchanged on every later request. It is never re-rendered.
-- `system` and `tools` do not change after the swap.
-- History stays append-only until the next compaction.
-- The cut never falls between a `toolUse` and its `toolResult`.
-- The summary is swapped in synchronously. A summary built in the background fails every turn produced while it was being built, the same way keep-tail does.
-
-**How this compares to server-side compaction.** On-demand compaction (`compact-2026-09-04`) keeps the preserved turns' thinking valid, so the model keeps that reasoning. The client-side options trade that reasoning for working on any provider, including Bedrock.
-
-</details>
-
-
-<details>
-<summary>How other agent harnesses use native compaction, and what it suggests for Strands</summary>
-
-Several open-source harnesses already call Anthropic's on-demand compaction (`compact-2026-09-04`): [docker-agent](https://github.com/docker/docker-agent) (`pkg/model/provider/anthropic/compaction.go`), [gptme](https://github.com/gptme/gptme) (`gptme/tools/autocompact/native_anthropic.py`), [cloudflare-os](https://github.com/cloudflare/cloudflare-os) (`packages/workshop-backend/src/anthropic-compaction.ts`), and [oh-my-pi](https://github.com/can1357/oh-my-pi) (`packages/ai/src/providers/anthropic-wire.ts`). None of them works around the signature check. They use the paths Anthropic supports: server-side compaction, `drop_block` as a fallback, simple client-side compaction, and server-side context editing.
-
-Suggestions for `Model.compact()` based on how they do it:
-
-1. **Expose `instructions` on `compact()`.** The `compaction` request field accepts an optional `instructions` string for a custom summarization prompt. docker-agent, gptme, and cloudflare-os all pass it through. cloudflare-os also appends "Do not call tools." because the request carries the live tool list, and the model may call a tool instead of summarizing. Incorporated into Approach 1: `compact()` takes `instructions`, filled from the strategy's `SummarizeConfig.systemPrompt`. The tool-call question is resolved in Open Questions: no compaction in the evals called a tool, so Strands adds no default instruction.
-
-2. **Check `stop_reason` and that exactly one compaction block came back.** docker-agent treats the response as valid only if `stop_reason == "compaction"` and `content` holds exactly one `compaction` block. Strands' `compact()` takes the first `compaction` block it finds, if any. A response that ends for another reason (for example, a tool call) should be treated as "nothing compacted".
-
-3. **Decide what a failed `compact()` falls back to.** Strands returns `undefined` and leaves the history unchanged on a history-bound model, so the context keeps growing until the next trigger (see "`AnthropicModel.compact()`"). gptme falls back to its generic client-side summary instead. Candidate fallbacks are simple client-side compaction (see "Client-side summarization that stays valid on preserved-thinking models" above) or server-side context editing (`clear_thinking_20251015` and `clear_tool_uses_20250919`, beta `context-management-2025-06-27`), which does not count as an edit to the prefix.
-
-4. **Consider checking support through the Models API.** gptme checks `client.beta.models.retrieve(model).capabilities.compaction.summarize.supported` and caches the answer per model. A failed lookup turns native compaction off and falls back. cloudflare-os uses a hard-coded list of models instead. Strands uses `capabilities.serverCompaction` from the model metadata, which combines a declared list, a user override, and what a rejected compaction request taught it. Fetching it from the Models API is a candidate source for that record later.
-
-5. **Bedrock is still unsolved.** Every harness above limits native compaction to the Claude API itself. docker-agent rejects any other provider, and gptme turns it off behind a proxy or gateway. This matches the open question on Bedrock customers without an Anthropic API key. The client-side options above work on Bedrock, at the cost of the reasoning in the summarized turns. On-demand compaction did work on Bedrock through `AsyncAnthropicBedrock` in every eval run (see "Server-Side Compaction Performance with Different `aux_model`" below), even though Anthropic's documentation doesn't list Bedrock as supported. Whether that support is intended or stable is unconfirmed.
-
-</details>
-
-
-<details>
-<summary>Anthropic code changes in appendix for API implementation</summary>
-
-When the signature does not match the prefix of a thinking block Anthropic responds to the request with this with the following error: 
-
-See Anthropic troubleshooting for more information on error
-
-Does Anthropic changes effect only the previous thinking block or all in the `chat_history`?
-
-What does Anthropic check exactly?
-
-The following is Anthropic's example for how compaction can be called with preserving recent messages: 
-https://platform.claude.com/docs/en/build-with-claude/compaction-keep-recent-turns
-
-The following is how `AnthropicModel` calls compaction through the API in the TypeScript SDK ([PR #5287](https://github.com/strands-agents/harness-sdk/pull/5287), `strands-ts/src/models/anthropic.ts`). `compact()` picks the cut point, sends the older messages to `beta.messages.create` with the live system prompt and tools plus `compaction: { type: 'summarize' }`, and returns `[summary message, ...preserved messages]`. The request formatter turns the summary's `TextBlock` back into the signed `compaction` block. The Python version in `strands-py/src/strands/models/anthropic.py` has the same shape. Doc comments are abridged.
-
-This is the PR as written, before the change to an overridable `compact()`. It still gates on `requiresServerSideCompaction` (`stream()` and `countTokens()` switch to `beta.messages` once it's set), and it splits inside `AnthropicModel`. Under this design `compactionSplitIndex` moves to `Model`, the gate becomes `capabilities.serverCompaction`, and the endpoint switch keys on a compaction block in the history.
-
-```typescript
-// strands-ts/src/models/anthropic.ts (excerpt)
-
-// Beta identifier required to send the top-level `compaction` request parameter.
-// https://platform.claude.com/docs/en/build-with-claude/compaction-keep-recent-turns
-const COMPACT_BETA = 'compact-2026-09-04'
-
-// `ProviderData.provider` value for payloads only this provider reads.
-const PROVIDER = 'anthropic'
-
-/** Whether `block` is a summary text block carrying an Anthropic compaction payload. */
-function isCompaction(block: ContentBlock): block is TextBlock & { providerData: ProviderData } {
-  return (
-    block.type === 'textBlock' &&
-    block.providerData?.provider === PROVIDER &&
-    block.providerData.data.type === 'compaction'
-  )
-}
-
-/**
- * Picks the index that starts the preserved tail for `AnthropicModel.compact`.
- *
- * Mirrors `OffloadConditions.preserveRecent`'s count-or-ratio shape, then nudges the cut point to
- * a user-turn boundary so a `toolUse` is never separated from its `toolResult`, and never cuts
- * before a pinned message. Returns 0 when the only message before the cut is a prior compaction,
- * since compacting it alone would not reduce the context.
- */
-function compactionSplitIndex(messages: Message[], preservedMessages: number): number {
-  if (messages.length === 0) return 0
-
-  const preserve = Math.max(0, preservedMessages)
-  const kept = preserve > 0 && preserve < 1 ? Math.ceil(messages.length * preserve) : Math.trunc(preserve)
-  const cut = Math.max(0, Math.min(messages.length - kept, messages.length))
-  let end = cut
-  for (let index = 0; index < cut; index++) {
-    if (isPinned(messages, index)) {
-      end = index
-      break
-    }
-  }
-
-  const promptIndexes: number[] = []
-  for (let index = 0; index < messages.length; index++) {
-    const message = messages[index]
-    if (message?.role === 'user' && !message.content.some((block) => block.type === 'toolResultBlock')) {
-      promptIndexes.push(index)
-    }
-  }
-
-  let split = 0
-  for (const index of promptIndexes) {
-    if (index > 0 && index <= end) split = index
-  }
-  if (split === 0 && promptIndexes.some((index) => index > 0 && index <= cut)) {
-    // The compaction block must open the history, so nothing can be kept verbatim ahead of it.
-    logger.warn(`pinned_index=<${end}> | pinned message precedes every cut point, skipping native compaction`)
-  }
-  if (split === 1 && messages[0]!.content.every(isCompaction)) return 0
-  return split
-}
-
-export class AnthropicModel extends Model<AnthropicModelConfig> {
-  // ...existing fields and methods
-
-  /** Reduces context through Anthropic's server-side compaction, instead of a client-side summary. */
-  override async compact(
-    messages: Message[],
-    conditions: {
-      utilization?: number
-      preservedMessages?: number
-      systemPrompt?: SystemPrompt
-      toolSpecs?: ToolSpec[]
-      instructions?: string
-    } = {}
-  ): Promise<Message[] | undefined> {
-    const { utilization, preservedMessages = 0, systemPrompt, toolSpecs, instructions } = conditions
-    const split = compactionSplitIndex(messages, preservedMessages)
-    if (split <= 0) {
-      logger.debug(
-        `preserved_messages=<${preservedMessages}>, messages=<${messages.length}> | nothing old enough to compact natively`
-      )
-      return undefined
-    }
-
-    const older = messages.slice(0, split)
-    const recent = messages.slice(split)
-    // The request must carry the same system prompt and tools as the live conversation --
-    // Anthropic binds a thinking block's signature to the exact prefix (system + tools + history)
-    // that produced it, and rejects a compaction request whose system/tools differ from what
-    // generated the thinking blocks being replayed into it.
-    const request = this._formatRequest(older, {
-      ...(systemPrompt !== undefined && { systemPrompt }),
-      ...(toolSpecs !== undefined && { toolSpecs }),
-    })
-    delete (request as { stream?: boolean }).stream
-
-    const compactionRequest = {
-      ...request,
-      compaction: { type: 'summarize', ...(instructions && { instructions }) },
-      betas: this._compactionBetas(),
-    }
-    logger.debug(`request=<${JSON.stringify(compactionRequest)}> | native compaction request`)
-
-    let response: Anthropic.Beta.Messages.BetaMessage
-    try {
-      response = await this._client.beta.messages.create(
-        compactionRequest as unknown as Anthropic.Beta.Messages.MessageCreateParamsNonStreaming
-      )
-    } catch (error) {
-      logger.warn(`model_id=<${this._config.modelId}>, error=<${error}> | native compaction request failed`)
-      return undefined
-    }
-
-    const block = (
-      response.content as Array<{ type: string; content?: string; signature?: string; encrypted_content?: string }>
-    ).find((candidate) => candidate.type === 'compaction')
-    if (!block || !block.content) {
-      logger.debug(
-        `utilization=<${utilization}>, model_id=<${this._config.modelId}> | provider produced no summary, leaving history unchanged`
-      )
-      return undefined
-    }
-
-    // The summary is ordinary text; the signed fields ride along for this provider to send back.
-    const data: Record<string, JSONValue> = {
-      type: 'compaction',
-      ...(block.signature !== undefined && { signature: block.signature }),
-      ...(block.encrypted_content !== undefined && { encrypted_content: block.encrypted_content }),
-    }
-    const summaryMessage = new Message({
-      role: 'assistant',
-      content: [new TextBlock(block.content, { provider: PROVIDER, data })],
-    })
-
-    logger.debug(
-      `model_id=<${this._config.modelId}>, compacted=<${older.length}>, preserved=<${recent.length}> | native compaction complete`
-    )
-    return [summaryMessage, ...recent]
-  }
-
-  // In the content-block formatter:
-  //   case 'textBlock':
-  //     if (isCompaction(block)) {
-  //       // A native compaction summary: the text plus the signed fields Anthropic returned with it.
-  //       return { ...block.providerData.data, content: block.text } as unknown as Anthropic.ContentBlockParam
-  //     }
-  //     return { type: 'text', text: block.text }
-
-  /**
-   * Betas for a beta-endpoint request: the compaction beta plus any configured ones.
-   *
-   * The SDK turns the body's `betas` into an `anthropic-beta` header that replaces the client's,
-   * so configured, client, and thinking-binding betas all go in the body.
-   */
-  private _compactionBetas(): string[] {
-    const betas = new Set([COMPACT_BETA, ...(this._config.betas ?? []), ...this._clientBetas])
-    if (this._dropsStaleThinking()) betas.add(THINKING_BINDING_BETA)
-    return [...betas]
-  }
-}
-```
-
-
-
-</details>
-
-
-<details>
-<summary>400 Errors when Conversation is Summarized Client Side</summary>
-
-This script demostrates the error Strands users will see when Offload.summarize starts. 
-
-```python
-
-
-"""Check whether ContextManager's message-level Offload.drop breaks preserved thinking.
-
-ConversationManager (and SlidingWindowConversationManager specifically) is being deprecated
-in favor of ContextManager. This is the ContextManager equivalent of sliding_window_thinking.py:
-``Offload.drop("*").when(utilization=..., preserve_recent=4)`` is message-level (because it has
-a `utilization` condition), so it physically removes whole old messages the same way
-SlidingWindowConversationManager does -- it just does it through the new strategy API.
-
-With preserve_recent=4, the manager drops the oldest messages after turn 3. Any thinking block
-that survives the drop has lost part of its prefix, so turn 4 should return a 400 if Bedrock
-enforces the prefix (or silently drop the block if it does not).
-"""
-
-import logging
-
-from simple_agent import model, word_count
-
-from strands import Agent
-from strands.experimental.context_manager import ContextManager, Offload
-
-logging.getLogger("strands").setLevel(logging.INFO)
-logging.getLogger("strands._context_manager").setLevel(logging.DEBUG)
-
-PROMPTS = [
-    "A bat and a ball cost $1.10 total. The bat costs $1.00 more than the ball. What does the ball cost?",
-    "If 5 machines make 5 widgets in 5 minutes, how long do 100 machines take to make 100 widgets?",
-    "A lily pad patch doubles daily and covers the lake on day 48. On what day was it half covered?",
-    "Summarize the three answers you gave so far in one line each.",
-    "Which of those puzzles is the most commonly answered wrong, and why?",
-]
-
-
-def thinking_indices(agent: Agent) -> list[int]:
-    """Return the indices of messages that contain a thinking block."""
-    return [i for i, m in enumerate(agent.messages) if any("reasoningContent" in c for c in m["content"])]
-
-
-def first_text(agent: Agent) -> str:
-    """Return the start of the first message's text, for sanity-checking what survived the drop."""
-    content = agent.messages[0]["content"]
-    return next((c["text"][:80] for c in content if "text" in c), "")[:80]
-
-
-agent = Agent(
-    model=model,
-    system_prompt="You are a concise, helpful assistant.",
-    tools=[word_count],
-    # Message-level: utilization condition routes this to _apply_per_message, which removes
-    # whole Message entries (same mechanism SlidingWindowConversationManager uses), rather than
-    # the per-block path (which already skips reasoningContent blocks).
-    context_manager=ContextManager(strategies=[Offload.drop("*").when(utilization=0.0, preserve_recent=4)]), # this potentially needs to be Offload.summarize perhaps
-    callback_handler=None,
-)
-
-if __name__ == "__main__":
-    for turn, prompt in enumerate(PROMPTS, start=1):
-        print(f"\n=== turn {turn}: {prompt[:60]!r}")
-        try:
-            result = agent(prompt)
-        except Exception as error:
-            print(f"ERROR on turn {turn}: {type(error).__name__}: {error}")
-            raise SystemExit(1) from None
-        print(
-            f"turn {turn}: stop_reason={result.stop_reason} messages={len(agent.messages)} "
-            f"thinking_at={thinking_indices(agent)} first={first_text(agent)!r}"
-        )
-
-```
-
-</details>
-
-<details>
-<summary>Server-Side Compaction Performance with Different `aux_model`</summary>
-
-This eval compares summary quality and thinking continuity across three ways of summarizing an Opus 5.5 conversation. It ran live against Bedrock (us-west-2) on PR #5287 at `5da3dd698`. The eval code is in [this gist](https://gist.github.com/jimbrub/fdd8a24b0c31e29874c5659e2e40e7eb).
-
-| Arm | Summarizer | Path |
-|---|---|---|
-| `native_same` | `aux_model` unset, so Opus 5.5 | `AnthropicModel.compact()` |
-| `native_haiku` | `aux_model` = Haiku 5.5 | `AnthropicModel.compact()` on Haiku, over Opus's history |
-| `client_drop` | `aux_model` = Opus 5.5, `requires_server_side_compaction=False` | client-side summary, then the SDK's `drop_block` retry |
-
-**Setup.** Opus 5.5 main agent, adaptive thinking at effort `high`. 6 scripted scenarios plant 7–10 facts through `lookup` calls, compact once with `preserve_recent=3`, then run a recall probe, a reasoning probe and a follow-up. Native arms set `prefix_mismatch_behavior: "error"` so an invalid thinking block fails instead of being dropped silently; every request carries `thinking-binding-controls-2026-08-01`, which reports each dropped block. 3 reps, 54 runs.
-
-| | `native_same` | `native_haiku` | `client_drop` |
+| Path | On-demand compaction | Threshold compaction | Block-binding |
 |---|---|---|---|
-| Compaction applied | 18/18 | 18/18 | 18/18 |
-| Pre-compaction thinking blocks replayed / dropped | 72 / 0 | 84 / 0 | 90 / 72 |
-| Post-compaction thinking blocks replayed / dropped | 72 / 0 | 80 / 0 | 106 / 0 |
-| Runs with a binding 400 (then `drop_block`) | 0 | 0 | 18 |
-| Summary quality, LLM judge (0–1) | 0.96 | 0.95 | 0.96 |
-| Facts kept in the summary | 0.98 | 0.94 | 0.99 |
-| Recall probe / reasoning probe | 1.00 / 1.00 | 1.00 / 1.00 | 1.00 / 1.00 |
-| Main-agent output tokens per run (after compaction) | 2,650 (716) | 2,726 (763) | 2,854 (938) |
-| Compaction or summarizer call, input / output tokens | 2,010 / 511 | 1,868 / 749 | 889 / 434 |
-| Compaction latency | 5.6 s | 4.6 s | 5.5 s |
+| Anthropic first-party | beta | beta | beta |
+| Claude Platform on AWS | beta | beta | supported |
+| Bedrock InvokeModel | not documented | beta | not documented |
+| Bedrock Mantle | not documented | beta | not documented |
+| Bedrock Converse | not documented | not documented | not documented |
 
-The judge is Sonnet 5.5, scoring completeness and faithfulness against the summarized messages. Token rows include native compaction's `usage.iterations`.
+What Strands sends, from mocked-transport runs (not live):
 
-**Findings.**
+- `AnthropicModel` reaches all four Anthropic clients when `model.client` is assigned after construction; `__init__` hard-codes `AsyncAnthropic`. The `drop_block` retry worked against all four.
+- `params={"compaction": ...}` raises `TypeError`. Compaction works via `extra_body`, betas via `extra_headers["anthropic-beta"]`. InvokeModel copies betas into the body only from per-request headers.
+- `BedrockModel` passes `thinking`, `anthropic_beta`, and `compaction` unchanged in `additionalModelRequestFields`. What Converse returns for them is unknown; its response has no field for a compaction block.
+- `VercelModel` doesn't round-trip reasoning signatures until #5532, has no binding retry, and drops text metadata. The installed `@ai-sdk/anthropic` appears to strip `thinking.block_binding` (unverified).
+- LiteLLM drops signatures on the way back in.
 
-- **Native compaction keeps preserved thinking valid.** No native run hit a 400 or dropped a block, before or after the compaction block.
-- **A cheaper `aux_model` can compact.** Haiku 5.5 compacted Opus 5.5's history in 18 of 18 runs with similar summary quality, at $0.10 against $4.00 per million input tokens. One Haiku summary invented a "Corrections" section.
-- **Client-side summaries are as good but lose the reasoning.** Every `client_drop` run hit a binding 400, and `drop_block` discarded 80% of pre-compaction thinking (72 of 90). The agent then produced 31% more output after compaction (938 against 716 tokens), consistent with regenerating lost reasoning; 8% more over the whole run.
-- **Native compaction works on Bedrock**, although Anthropic's docs list it as unavailable there.
-- **The client-side summarizer request is malformed.** Its first request failed in all 18 runs (`tool_use` blocks in a user message) and fell back to text only, so tool content never reached it. See PR #5287.
+### Current flow (#5470, unmerged)
 
-**Limits.** Short conversations (~20k input tokens per run) with one compaction each. The probes scored 1.00 everywhere, partly because the preserved tail restates facts, so they don't separate the arms. Prompt caching was off. Not measured: the direct Claude API, other model pairs, repeated compaction.
+```mermaid
+flowchart TD
+  apply["Offload.summarize('*').when(...).apply(context)"] --> select
+  select["_select: cut at preserve_recent, recency move off last message, pins, tool pairs"] --> plan
+  plan["_plan_after_message_zero(messages, indices, compacts)<br/>model = config.model or agent.aux_model<br/>None = pass skipped"] --> decide{"opening prefix AND compacts?"}
+  decide -- no --> bcall["Model.summarize (base) -> model.stream(flattened transcript, summarizer prompt)"]
+  decide -- yes --> ncall["model.summarize override (provider compaction)<br/>messages[0:cut] + live tools and system"]
+  bcall --> bpost["_with_summarized_marker (header)<br/>_place_summary (join neighbor, merged_messages)<br/>message 0 kept"]
+  ncall --> npost["placed verbatim first, replacing message 0"]
+  ncall -.->|"native unavailable: super().summarize()"| fb["base post-processing, message 0 replaced"]
+  bpost --> record["_record_summary_usage"]
+  npost --> record
+  fb --> record
+```
 
-</details>
+### Target flow (proposed)
 
-<details>
-<summary>Repeated Server-Side Compaction and Custom Instructions</summary>
+```mermaid
+flowchart TD
+  apply["Offload.summarize('*').when(...).apply(context)"] --> resolve
+  resolve["resolve: summarizer_model = config.model or agent.aux_model<br/>caps = summarizer_model.model_info.capabilities"] --> dn{"caps.server_side_compaction is True?"}
+  dn -- "yes" --> ncut["plan_cut(messages, keep_head=0)"]
+  dn -- "no / None" --> bcut["plan_cut(messages, keep_head=1)"]
+  subgraph NATIVE["NATIVE SUMMARIZER (provider-side)"]
+    ncut --> nreq["SummaryRequest: head + body from message 0, live system and tools"]
+    nreq --> ncall["NativeSummarizer.summarize -> model.compact()"]
+  end
+  subgraph BASE["BASE SUMMARIZER (client-side)"]
+    bcut --> breq["SummaryRequest: cut.body only, summarizer prompt, no tools"]
+    breq --> bcall["BaseSummarizer.summarize -> model.stream()"]
+  end
+  ncall -.->|None: re-cut with keep_head=1| bcut
+  ncall --> out
+  bcall --> out["SummaryResult: TextBlock + metadata.offloaded, providerData only from native"]
+  out --> place["place: head + [summary] + tail, never joined<br/>native: block first, message 0 pending re-statement"]
+  place --> render["render: shared same-role merge for the wire<br/>metadata off the wire, providerData to its provider only"]
+  render --> record["record usage"]
+```
 
-This eval tests three things on longer conversations: whether detail survives repeated compaction, whether a custom summarization prompt helps, and how reasoning lost by client-side summaries compounds. It ran live against Bedrock (us-west-2) on PR #5287 at `44a8f6ab9`. The eval code is in [this gist](https://gist.github.com/jimbrub/bc7898b0a9e9ab9ccf57a4684e1e75db).
+### Classes (proposed)
 
-| Arm | Path | Compactions |
-|---|---|---|
-| `native_frequent` | `AnthropicModel.compact()`, `aux_model` unset | before turns 6, 11, 16, 21 and 26 |
-| `native_rare` | same | before turns 14 and 26 |
-| `native_instructions` | `native_rare` plus `Offload.summarize("*", {"system_prompt": INSTRUCTIONS})`, sent as `compaction.instructions` | before turns 14 and 26 |
-| `client_drop` | client-side summary by an Opus 5.5 `aux_model`, then the SDK's `drop_block` retry | before turns 14 and 26 |
+```mermaid
+classDiagram
+  class SummarizeStrategy {
+    +apply(context) bool
+    +resolve(agent) Summarizer
+    +plan_cut(messages, keep_head) Cut
+    +place(messages, cut, block)
+  }
+  class Cut {
+    <<dataclass>>
+    head: Messages
+    body: Messages
+    tail: Messages
+  }
+  class Summarizer {
+    <<protocol>>
+    keep_head: int
+    +summarize(request: SummaryRequest) SummaryResult | None
+  }
+  class BaseSummarizer {
+    model: Model
+    keep_head = 1
+  }
+  class NativeSummarizer {
+    model: Model
+    keep_head = 0
+    restate_head: bool
+  }
+  class SummaryRequest {
+    messages: Messages
+    system_prompt: native only
+    tool_specs: native only
+    instructions: str | None
+    cancel_signal
+  }
+  class SummaryResult {
+    block: TextBlock
+    usage: Usage | None
+  }
+  class Model {
+    model_info: ModelInfo
+    +stream(...)
+    +compact(request) SummaryResult | None
+  }
+  class ModelCapabilities {
+    server_side_compaction: bool | None
+  }
+  class TextBlock {
+    text: str
+    metadata: TextBlockMetadata | None
+    providerData: ProviderData | None
+  }
+  SummarizeStrategy ..> Cut : plans
+  SummarizeStrategy ..> Summarizer : resolves one
+  SummarizeStrategy ..> ModelCapabilities : reads
+  BaseSummarizer ..|> Summarizer
+  NativeSummarizer ..|> Summarizer
+  Summarizer ..> SummaryRequest : takes
+  Summarizer ..> SummaryResult : returns
+  BaseSummarizer ..> Model : stream
+  NativeSummarizer ..> Model : compact
+  Model *-- ModelCapabilities
+  AnthropicModel --|> Model
+  BedrockModel --|> Model
+  SummaryResult *-- TextBlock
+```
 
-**Setup.** Opus 5.5 main agent, adaptive thinking at effort `high`, prompt caching on. 4 scripted 28-turn scenarios plant 9–13 facts through `lookup` calls in turns 2–5; turns 6–25 are filler that never restates them; turns 26–28 are a recall probe, a reasoning probe and a follow-up. Compaction runs on a fixed schedule with `preserve_recent=3`. `INSTRUCTIONS` asks the summarizer to keep identifiers, numbers and open requests verbatim and not to call tools. 3 reps, 48 runs, 132 compactions.
+`AnthropicModel.compact()` calls `compact-2026-09-04`. `BedrockModel.compact()` returns `None` and its capability is `False`. Both strip thinking a summary invalidated where `drop_block` can't apply.
 
-A **fact** is a value that appears only in a `lookup` result, such as the build id `build-20261013-amberfox`. After each compaction the eval checks that the summary still contains it, so a fact surviving five compactions has been re-summarized five times.
+### Previously considered
 
-| | `native_frequent` | `native_rare` | `native_instructions` | `client_drop` |
-|---|---|---|---|---|
-| Compaction applied | 60/60 | 24/24 | 24/24 | 24/24 |
-| Compaction calls that returned `tool_use` | 0 | 0 | 0 | – |
-| Facts kept in the latest summary | 1.00 | 1.00 | 1.00 | 1.00 |
-| Recall probe | 1.00 | 1.00 | 1.00 | 1.00 |
-| Summary quality, LLM judge (0–1), all / last compaction | 0.94 / 0.90 | 0.93 / 0.92 | 0.95 / 0.94 | 0.85 / 0.76 |
-| Pre-compaction thinking blocks replayed / dropped | 47 / 0 | 24 / 0 | 24 / 0 | 24 / 24 |
-| Runs with a binding 400 | 0 | 0 | 0 | 12 |
-| Summary length at the last compaction | 7,800 chars | 6,700 chars | 12,000 chars | 7,500 chars |
-| Latency per compaction | 17.8 s | 19.1 s | 32.0 s | 22.8 s |
-| Cost per run, main agent / compaction or summarizer | $0.74 / $0.24 | $0.75 / $0.10 | $0.76 / $0.18 | $0.75 / $0.19 |
-| Main-agent input read from cache | 85% | 92% | 92% | 92% |
+From earlier revisions of this design, still rejected:
 
-Costs use Claude API prices. Cache share is cache reads over all main-agent input tokens, excluding compaction calls. The judge is Sonnet 5.5.
+- **A `CompactionBlock` content type.** Widens the public content-block union; every provider that can't send it must reject or convert it. `providerData` on `TextBlock` (#5402) degrades to text instead.
+- **Storing only the summary text, discarding the signature.** The API can't tell it from a client summary, so kept turns' thinking is invalidated and native compaction offers nothing over a base summary.
+- **A `requiresServerSideCompaction` config flag.** Can't represent "unknown", and duplicates model metadata capabilities.
 
-**Findings.**
+### Implementation plan
 
-- **Facts survived repeated compaction.** Every native compaction over an existing compaction block succeeded, and every planted fact was still in the summary after five compactions. Completeness fell slightly (5.0 to 4.25) as summaries shed filler. Compacting five times instead of twice cost $0.14 more per run and cut the cache share from 92% to 85%, since each compaction starts a new cache prefix.
-- **The summarizer never called tools** in 108 native compaction calls, even with tools in the request.
-- **Custom `instructions` made summaries 1.8× longer and 1.7× slower, not better** (judge 0.95 against 0.93).
-- **Native compaction costs about half as much** ($0.10 against $0.19 per run): 90–95% of its input is a cache read of the conversation prefix. The client-side summarizer request has a different prefix, so it can't reuse that cache (and `aux_model` had caching off here).
-- **Client-side summaries silently drop the tail's thinking at every compaction** (24 of 24). Only the first compaction surfaces a 400; after that `drop_block` stays on.
-- **The client-side path summarized the newest exchange.** Tool-use/result pairing widened the cut past `preserve_recent=3`, and in 12 of 12 runs the summary listed an answered request as still pending, which explains its lower judge score.
-- **The client-side summarizer request is still malformed**, rejected at all 24 compactions before falling back to text only.
+Each row is one PR per SDK, or one PR with both and parity noted in the description. Every PR passes the `ci.yml` merge gate, carries its cognitive-complexity label (checked with `npm run complexity` / `hatch run complexity`), and runs any `tests_integ` it adds in CI.
 
-**Limits.** Fact recall is at ceiling in every arm: ~20k tokens of history fits in a 7–12k-character summary, so these runs don't show where summaries start losing facts. The reasoning probe is a real test in only 2 of 4 scenarios. One run with two unplanted facts is excluded from fact scores. Not measured: the direct Claude API, other models, threshold-triggered compaction, longer conversations.
+| # | Deliverable | Scope | Depends on | Acceptance criteria | Tests | Risk |
+|---|---|---|---|---|---|---|
+| 1 | `TextBlock.metadata.offloaded` | TS: #5325. Python: `types/content`, offload strategies | — | Drop/truncate placeholders are detected by `metadata.offloaded`, not regex; metadata round-trips through session save/restore in both SDKs and never reaches a provider request | unit: round-trip, every formatter omits metadata | #5325 is a larger breaking change; Python needs its own PR |
+| 2 | `providerData` on `TextBlock` (#5402) | content types, session serialization, every provider formatter | 1 | A block with `providerData` for provider X renders natively on X and as plain text on every other provider; restored sessions keep it | unit per formatter; mocked-wire for Anthropic | Missing a formatter leaks opaque data |
+| 3 | `server_side_compaction` capability (#5466) | `_model_info.py` / `model-info.ts`, wrappers | — | Field exists, defaults `None`; wrappers report the inner model's value; `model_info` override wins | unit | Name must match #5466 and #5405 |
+| 4 | Pure `plan_cut` | `offload/summarize.py`, `offload/summarize.ts` | — | `plan_cut` has no I/O; tool pairs never split; body/tail roles alternate; stops at first pin; earlier summary rolls into body; #5736 fuzz corpus passes with no skipped pass | unit + property tests, shared fixtures across SDKs | Behavior change for early pins (O3) |
+| 5 | Summarizer split (#5733, rework of #5470) | `offload/summarize.*`, `models/_summarize.py`, `models/summarize.ts`, `models/model.*` | 1, 3, 4 | No `Model.summarize()`, no `_overrides_summarize`, no `[Summarized:` string match on write; `BaseSummarizer` path places `head + [summary] + tail`; `Model.compact()` exists and returns `None` by default; `None` re-cuts with `keep_head=1` | unit: both paths, fallback, usage recorded once per pass | Largest PR; split into base and native-scaffold PRs if it crosses the complexity label |
+| 6 | Shared same-role merge at render | shared pre-format step used by every provider | 5 | Stored history unchanged after a request; every provider receives alternating roles; base-path wire bytes match `main` for the same history | unit per provider; mocked-wire Anthropic, Bedrock | A third-party provider that bypasses the shared step (O6) |
+| 7 | Session compatibility | summarize strategy read path | 5 | A session saved with the `[Summarized:` header is recognized as a summary for one release; a new session never contains the header | unit with saved fixtures | Dual detection lingers past one release |
+| 8 | Anthropic native compaction (#5401) | `models/anthropic.*` | 2, 5 | `compact()` sends `compact-2026-09-04` with live system and tools; returns `None` when unavailable; result carries `providerData` and is sent back byte-identical; `compaction` is a first-class parameter; capability stays `None` (opt-in) | unit; mocked-wire T3 scenarios; integ on first-party | Beta API changes |
+| 9 | Provider-owned stripping for `between_tools` | `models/anthropic.*`, `models/bedrock.*`, `_thinking_binding.py` / `thinking-binding.ts` | 5 | Where `block_binding` can't be set, stale thinking after a summary is stripped before send; no 400 reaches the caller in the T3 `between_tools` scenario | unit; mocked-wire | Strips reasoning that would have been accepted |
+| 10 | Usage and dropped-thinking metrics (#5404) | `models/anthropic.*`, `models/bedrock.*`, telemetry | 8, 9 | Compaction and base summary usage appear in `AgentResult.metrics`; dropped blocks from `input_transformations` and `drop_block` retries are counted | unit; mocked-wire hooks | Metric name parity |
+| 11 | Native head re-statement | summarize strategy, Anthropic formatter | #5176, 8 | `place()` records message 0; it is sent as `role: "system"` after the first new user turn following the kept turns; kept thinking stays valid | unit; integ `compact_keep3` | Timing (O2) |
+| 12 | Default flip and docs (#5405) | `AnthropicModel` capability table, site docs | 11, validation V4 | Preserved-thinking IDs declare `True`; docs cover routing, opt-out, cost, and the provider matrix | integ T4 matrix; docs build | User-visible behavior change |
 
-</details>
+Follow-ups, not in this plan (T7): a supported `client=` parameter on `AnthropicModel`; `VercelModel` text-metadata round trip, binding retry, and `block_binding` support (after #5532); LiteLLM signature capture.
 
-<details>
-<summary>Sending the compaction summary as text vs. as the signed block</summary>
+### Validation plan
 
-This experiment tests whether Strands needs to keep Anthropic's signature, or whether the compaction's summary text alone keeps the preserved thinking valid. It ran live against Bedrock (us-west-2) with Opus 5.5, adaptive thinking, and `prefix_mismatch_behavior: "error"`.
+**Existing evidence.** Source reads at #5470's head; mocked-transport runs of all four `AnthropicModel` clients and `BedrockModel`; the two Anthropic docs pages. None of this shows live provider support.
 
-**Setup.** A 3-turn tool-using conversation. The first two turns were natively compacted, and the last turn, which holds a thinking block, was kept verbatim. The history `[summary, ...kept turn, new prompt]` was then resent with the summary encoded different ways:
+**New unit tests.** `plan_cut` property tests with the #5736 corpus; both summarizers; `None` fallback; render merge per provider; metadata and `providerData` round-trips; session fixtures with the old header. Offline tests use a transport that raises on any unmocked request, because `client.with_options(...)` on the Bedrock and Mantle clients drops a custom `http_client` and sent real requests in earlier runs.
 
-| Summary sent as | Result |
+**New mocked-wire tests.** The T3 scenarios with the retry bypassed, asserting request shape only: block first, byte-identical round trip, betas in the body for InvokeModel and in a header for Mantle.
+
+**New integration tests (`tests_integ`, CI on the PR).** First-party Anthropic: T3 scenarios with `prefix_mismatch_behavior: "error"`, A = Sonnet 5.5, B = Haiku 5.5.
+
+| Scenario | Expected |
 |---|---|
-| Signed compaction block, unchanged | 200 |
-| Assistant text containing the compaction `content` | 400 `Invalid signature in thinking block… bound to a different conversation` |
-| Assistant text with Strands' `[Summarized: …]` header | 400, same error |
-| User text merged into the first kept user message | 400, same error |
-| Compaction block with its `content` edited | 400 `content does not match its signature` |
-| Compaction block without its `signature` | 400 `requires its signature: send the block exactly as it was returned` |
-| Assistant text, with `drop_block` | 200, the kept thinking block dropped (`thinking_dropped`, `prefix_binding_mismatch`) |
+| append_only | 200 |
+| prefix_edit | 400 binding |
+| model_switch | 200, A's blocks dropped |
+| compact_same | 200, nothing dropped |
+| compact_cross (B compacts) | 200 |
+| compact_keep3 | 200, kept thinking valid |
+| client_summary | 400 binding |
+| base_summary_drop | 200, tail dropped |
+| drop_block on Sonnet 4.6 | 200 |
+| block_binding with `between_tools` | 400 field rejected |
 
-With the signed block, the pre-compaction thinking stayed valid across 3 more appended turns.
+**Live work needing credentials beyond CI.**
 
-**Prototype.** The `providerData` design was prototyped on PR #5287's branch and run with `simple_agent_native_compact.py`. All four checks passed: 6 compactions, each signed; the kept thinking was replayed after each compaction; the broken-prefix controls were rejected; and a fact from turn 1 was recalled on the last turn. A JSON round-trip of the history continued on `AnthropicModel`. The same history sent through `BedrockModel` (Converse) returned a 400 under `error` and succeeded under `drop_block`, because Converse receives the summary as plain text.
+| ID | Experiment | Settles | Result that settles it |
+|---|---|---|---|
+| V1 | On-demand compaction and `input_transformations` on InvokeModel and Mantle; Converse response for `compaction` | O1 | 200 with a compaction block → native allowed on that path; anything else → capability `False` there |
+| V2 | T4 matrix: `AnthropicModel` four clients, `BedrockModel`, `VercelModel` after #5532, × four models × base / native / native with Haiku 5.5 `aux_model`; multi-turn tool task forcing 2–3 passes, `preserve_recent=3` | O1, O6 | No 400 reaches the caller; message 0 kept (base) or re-stated (native); native only when the capability is `True` |
+| V3 | Pin and filter replay: built-in configs over recorded histories with early pins and `"tool_results"` filters | O3, O4 | Tokens reclaimed close to #5470's planner (threshold to agree in review), or a documented regression accepted |
+| V4 | #5734 evaluation: fact recall and task success over repeated passes, base vs native, `keep_head` 0 vs 1 | O7 | Native recall ≥ base before the default flips; chosen prompt for #5735 |
+| V5 | T5 metrics on V2 runs: `drop_block` retries (log handler), dropped blocks (response hooks), compaction vs fallback counts, tokens/cost/latency | O8 | Retry count per session; if retries are routine on preserved-thinking IDs, revisit D4 |
 
-**Findings.**
+### Decisions needed
 
-- **The signature is required.** Without it, the summary is indistinguishable from a client-side one and the preserved thinking fails the binding check.
-- **The text has to stay byte-identical.** Any edit to the summary is rejected, which is why strategies skip text blocks with `providerData`.
-- **Other providers degrade to a client-side summary.** They send the text, which works under `drop_block` at the cost of the preserved reasoning.
+| # | Question | Recommendation | Cost |
+|---|---|---|---|
+| D1 | Default native on, or opt-in until #5176 + re-statement? (O2) | Opt-in until row 11 lands; fall back to summarizer instructions asking to keep the task for models without system messages | Preserved-thinking users keep paying `drop_block` reasoning loss until then |
+| D2 | Where does same-role merging happen? (O6) | One shared pre-format step, called by every vended provider and documented for third-party ones | Third-party providers that format raw history must adopt it |
+| D3 | Saved sessions with the `[Summarized:` header (O5) | Read-time dual detection for one release, then remove | One more release of string matching on read |
+| D4 | Set `drop_block` up front for preserved-thinking IDs, or only reactively? (O8) | Reactive, pending V5 | One failed request per model per session |
+| D5 | `compact()` on `Model` or a separate protocol? (O9) | On `Model`, returning `None` by default: it needs the provider client, and capability routing already gates it | One more method on the base class |
+| D6 | Message-level target filters with a contiguous body (O4) | Filters select blocks within `body`; non-contiguous message selection isn't supported for summaries | Pending V3 |
+| D7 | Cut stops at the first pin (O3) | Keep, pending V3 | Possible smaller reclaim for early pins |
+| D8 | `keep_head` default and prompt (O7) | Base 1 until #5734 reports | Possible drift across rolling summaries |
 
-**Limits.** The negative controls in `simple_agent_native_compact.py` must replay through an `Agent` with the same `ContextManager` as the live one. Without it, the `retrieve_context` tool is missing, the tool list differs, and every replay returns a 400 regardless of the summary. The results above use matching tools. Not measured: the direct Claude API, other models.
-
-</details>
-
-<details>
-<summary>Notes</summary>
-
-Strands implements a `ContextManager` which allows users to do several things with their agent's context windows:
-
-- Truncate
-- Summarize
-- Drop
-- Emergency Truncation
-- Agentic/model-driven editing (has 3 tools)
-    - `summarize_context`
-    - `truncate_context`
-    - `pin_context`
-
-Context management techniques that the Strands Agents SDK utilizes are going to return a 400 error when using models with preserved thinking (currently Fable 5.1, Sonnet 5.5, Haiku 5.5, and Opus 5.5). Preserved thinking requires that when a `thinking_block` is created, then the entire prefix (system prompt, tool list, and chat history) needs to remain the same turn over turn when sending requests to Anthropic. 
-
-See appendix for information on where in the Strands SDK a summary method is implemented. 
-
-
-What is retroactive?
-A retroactive strategy is one configured to rewrite chat history the model has already seen: any message-level strategy (a utilization condition), or a per-block strategy with preserve_recent > 0. A thinking block is bound to everything before it: system prompt, tools, and earlier messages. A retroactive edit therefore invalidates only the thinking blocks that come after the edited content and are still replayed. The API then rejects the request with a 400, or drops those blocks under drop_block. Retroactive does not always mean broken: an edit after the last replayed thinking block, or one that leaves no later thinking block, is safe. Strands still routes every retroactive summary to server-side compaction on models whose `serverCompaction` is `true`, because it can't tell in advance which edits are safe.
-
-
-### Resolved questions
-
-- [x] **Does compaction need a provider-specific block type?** No. The summary is stored as a `TextBlock` with an opaque `providerData` field that only the producing provider reads, so Part 3's OpenAI compaction reuses the same field. See "Storing the compaction as a summary".
-- [x] **Aligning `compact()` with Strands' API.** `compact()` takes the strategy's `preservedMessages` plus the live `systemPrompt` and `toolSpecs` and the strategy's `instructions`, so `Offload.summarize(...).when(...)` is the only API customers learn. See Approach 1.
-- [x] **How is server-side compaction gated and called?** Like token counting: `Model.compact()` has a client-side default, and `AnthropicModel` overrides it, gated by `capabilities.serverCompaction` from the model metadata design (#5305) rather than a config flag. See Approach 1.
-- [x] **Model resolution.** The strategy resolves the model once (`this._config.model ?? agent.auxModel`) and calls `compact()` on it. It never reads `agent.model` directly.
-- [x] **Keeping the compaction request's system prompt and tools in sync.** `compact()` sends the agent's current system prompt and tool specs, so the request matches the conversation unless they changed mid-session. Part 2 covers mid-session changes.
-- [x] **Anthropic on Bedrock.** `AnthropicModel` with a Bedrock client works; `BedrockModel` (Converse) doesn't support compaction. See "Anthropic models on Bedrock".
-- [x] **What should `compact()` do when the summarizer calls a tool?** The compaction request carries the live tool list, so the model could call a tool instead of summarizing; the API would then return `stop_reason: "tool_use"` with no summary, and `compact()` would leave the history unchanged. None of 108 native compactions did this, with or without custom `instructions`, even with a `save_note` tool in the request (see "Repeated Server-Side Compaction and Custom Instructions"). `compact()` keeps Anthropic's default summarization prompt and adds no "Do not call tools" instruction, which would replace that prompt entirely. If it happens, the history is left unchanged and the strategy tries again the next time it runs. A one-time retry with a no-tools instruction is the follow-up if it shows up in practice.
-
+O10: #5470, #5325, #5402, #5466, #5401, and #5176 are open. No row above treats their contracts as landed. Release gates beyond CI and deadlines: none known.
 
 </details>
