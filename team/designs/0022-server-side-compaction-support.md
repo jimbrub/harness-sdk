@@ -57,9 +57,9 @@ On `main`, the summarize strategy writes a client-side summary on every provider
 
 #5470 is reworked into this split (#5733), so `Model.summarize()` never ships and needs no deprecation. All interfaces below are a proposed API.
 
-1. **Resolve.** `summarizer_model = config.model or agent.aux_model`. `resolve(agent)` returns `NativeSummarizer` when `summarizer_model.model_info.capabilities.server_side_compaction is True`; `False` or `None` returns `BaseSummarizer`. Providers declare the value and developers override it through `model_info`. Wrappers report the inner model's `model_info`. No method-identity checks.
+1. **Resolve.** `summarizer_model = config.model or agent.aux_model`. `resolve(agent)` returns `NativeSummarizer` when `summarizer_model.model_info.capabilities.server_side_compaction is True`; `False` or `None` returns `BaseSummarizer`. It returns `None`, and the pass is skipped, when no summarizer model resolves. Providers declare the value and developers override it through `model_info`. Wrappers report the inner model's `model_info`. No method-identity checks.
 2. **Cut.** `plan_cut(messages, keep_head)` reads `preserve_recent` from the config and returns `Cut(head, body, tail)`. It's a pure function: tool pairs stay whole, roles alternate at the body/tail boundary, it stops at the first pin, and an earlier summary rolls into `body`. Each summarizer carries its own `keep_head`: base 1, native 0.
-3. **Summarize.** `BaseSummarizer` sends `cut.body`, flattened, with the summarizer prompt and no live system or tools, through `model.stream`. `NativeSummarizer` sends `head + body` (starting at message 0) with live system and tools to `Model.compact()`; the tail isn't sent. If `compact()` returns `None`, the strategy re-cuts with `keep_head = 1` and runs the base path in the same pass.
+3. **Summarize.** `BaseSummarizer` sends `cut.body`, flattened, with the summarizer prompt and no live system or tools, through `model.stream`. `NativeSummarizer` sends `cut.body`, which starts at message 0 because its `head` is empty, with live system and tools to `Model.compact()`; the tail isn't sent. If `compact()` returns `None`, the strategy re-cuts with `keep_head = 1` and runs the base path in the same pass.
 4. **Result.** `SummaryResult.block` is a `TextBlock` with `metadata.offloaded = {method: "summarize"}`. Only native results carry `providerData` (#5402).
 5. **Place.** `head + [summary] + tail`, never joined, so `merged_messages` goes away. On the native path the block is first, and `place()` records message 0 for re-statement.
 6. **Render.** One shared pre-format step merges adjacent same-role messages for the wire without changing stored history. `metadata` never reaches the wire; `providerData` reaches only its own provider and renders as plain text elsewhere.
@@ -209,7 +209,7 @@ flowchart TD
   dn -- "yes" --> ncut["plan_cut(messages, keep_head=0)"]
   dn -- "no / None" --> bcut["plan_cut(messages, keep_head=1)"]
   subgraph NATIVE["NATIVE SUMMARIZER (provider-side)"]
-    ncut --> nreq["SummaryRequest: head + body from message 0, live system and tools"]
+    ncut --> nreq["SummaryRequest: cut.body from message 0 (head empty), live system and tools"]
     nreq --> ncall["NativeSummarizer.summarize -> model.compact()"]
   end
   subgraph BASE["BASE SUMMARIZER (client-side)"]
@@ -230,7 +230,7 @@ flowchart TD
 classDiagram
   class SummarizeStrategy {
     +apply(context) bool
-    +resolve(agent) Summarizer
+    +resolve(agent) Summarizer | None
     +plan_cut(messages, keep_head) Cut
     +place(messages, cut, block)
   }
