@@ -94,7 +94,10 @@ Every number above is a single sample, and single samples have been unreliable: 
 warm-cache measurement exists anywhere in this work (gap 24).
 
 So for any probe whose result decides something, run it **three times back to back** and report the spread. For the
-harness audit specifically, run the three samples inside five minutes so at least one is warm:
+harness audit specifically, run the three samples inside five minutes so at least one is warm. `cache-audit.ts` lives
+in `harness-ts/`, not `strands-ts/`, and is not an npm workspace member - see the setup steps in its own header
+comment (copy it from `cache-probes/cache-audit.ts` into `harness-ts/test/integration/`, `npm ci` there, symlink the
+SDK). Once set up, from `harness-ts/`:
 
 ```bash
 for sample in 1 2 3; do
